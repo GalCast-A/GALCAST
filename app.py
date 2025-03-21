@@ -141,13 +141,11 @@ class PortfolioAnalyzer:
         return img_str
 
     def plot_correlation_matrix(self, prices, fig_size=(10, 6)):
-        """Plot the correlation matrix of portfolio stocks and return as base64."""
+        """Compute and print the correlation matrix of portfolio stocks instead of plotting."""
         corr_matrix = prices.corr()
-        plt.figure(figsize=fig_size)
-        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f")
-        plt.title("Correlation Matrix of Portfolio Stocks")
-        plt.tight_layout()
-        return self.plot_to_base64(plt)
+        print("\n**Correlation Matrix of Portfolio Stocks:**")
+        print(corr_matrix.to_string(float_format="%.2f"))
+        return "Correlation matrix printed"
 
     def adjust_weights_over_time(self, tickers, weights, returns):
         """Adjust weights dynamically, ensuring alignment with returns data."""
@@ -167,31 +165,41 @@ class PortfolioAnalyzer:
         return weights_df.fillna(method='ffill')
 
     def plot_cumulative_returns(self, returns, weights, benchmark_returns=None, optimized_weights=None, sortino_optimized_weights=None, earliest_dates=None, user_start_date=None, fig_size=(10, 6)):
-        """Plot cumulative returns including Sortino-optimized portfolio and return as base64."""
+        """Compute and print cumulative returns metrics instead of plotting."""
         earliest_date = max([d for d in earliest_dates.values()] + [pd.to_datetime(user_start_date)])
         adjusted_returns = returns.loc[earliest_date:]
         if adjusted_returns.empty:
             print(f"⚠️ No data available after adjusting start date to {earliest_date.strftime('%Y-%m-%d')}.")
             return None, None
 
-        plt.figure(figsize=fig_size)
         tickers = returns.columns
         weights_df = self.adjust_weights_over_time(tickers, weights, adjusted_returns)
         portfolio_returns = (adjusted_returns * weights_df).sum(axis=1)
         cumulative = (1 + portfolio_returns).cumprod() - 1
-        plt.plot(cumulative, label='Current Portfolio', linewidth=2)
+
+        print(f"\n**Cumulative Returns Metrics (From {earliest_date.strftime('%Y-%m-%d')}):**")
+        print("\n--- Current Portfolio ---")
+        print(f"Final Cumulative Return: {cumulative.iloc[-1]:.2%}")
+        print(f"Max Cumulative Return: {cumulative.max():.2%}")
+        print(f"Min Cumulative Return: {cumulative.min():.2%}")
 
         if optimized_weights is not None:
             opt_weights_df = self.adjust_weights_over_time(tickers, optimized_weights, adjusted_returns)
             opt_returns = (adjusted_returns * opt_weights_df).sum(axis=1)
             opt_cumulative = (1 + opt_returns).cumprod() - 1
-            plt.plot(opt_cumulative, label='Optimized Portfolio (Max Sharpe)', linewidth=2, linestyle='--')
+            print("\n--- Optimized Portfolio (Max Sharpe) ---")
+            print(f"Final Cumulative Return: {opt_cumulative.iloc[-1]:.2%}")
+            print(f"Max Cumulative Return: {opt_cumulative.max():.2%}")
+            print(f"Min Cumulative Return: {opt_cumulative.min():.2%}")
 
         if sortino_optimized_weights is not None:
             sortino_opt_weights_df = self.adjust_weights_over_time(tickers, sortino_optimized_weights, adjusted_returns)
             sortino_opt_returns = (adjusted_returns * sortino_opt_weights_df).sum(axis=1)
             sortino_opt_cumulative = (1 + sortino_opt_returns).cumprod() - 1
-            plt.plot(sortino_opt_cumulative, label='Optimized Portfolio (Max Sortino)', linewidth=2, linestyle='-.')
+            print("\n--- Optimized Portfolio (Max Sortino) ---")
+            print(f"Final Cumulative Return: {sortino_opt_cumulative.iloc[-1]:.2%}")
+            print(f"Max Cumulative Return: {sortino_opt_cumulative.max():.2%}")
+            print(f"Min Cumulative Return: {sortino_opt_cumulative.min():.2%}")
 
         if benchmark_returns is not None:
             if isinstance(benchmark_returns, dict):
@@ -199,27 +207,25 @@ class PortfolioAnalyzer:
                     bench_series = series.loc[earliest_date:]
                     if not bench_series.empty:
                         bench_cumulative = (1 + bench_series).cumprod() - 1
-                        plt.plot(bench_cumulative, label=f'Benchmark: {key}', linewidth=2)
+                        print(f"\n--- Benchmark: {key} ---")
+                        print(f"Final Cumulative Return: {bench_cumulative.iloc[-1]:.2%}")
+                        print(f"Max Cumulative Return: {bench_cumulative.max():.2%}")
+                        print(f"Min Cumulative Return: {bench_cumulative.min():.2%}")
             else:
                 bench_series = benchmark_returns.loc[earliest_date:]
                 if not bench_series.empty:
                     bench_cumulative = (1 + bench_series).cumprod() - 1
-                    plt.plot(bench_cumulative, label='Benchmark', linewidth=2)
+                    print("\n--- Benchmark ---")
+                    print(f"Final Cumulative Return: {bench_cumulative.iloc[-1]:.2%}")
+                    print(f"Max Cumulative Return: {bench_cumulative.max():.2%}")
+                    print(f"Min Cumulative Return: {bench_cumulative.min():.2%}")
 
-        plt.title(f'Cumulative Returns (From {earliest_date.strftime("%Y-%m-%d")})')
-        plt.xlabel('Date')
-        plt.ylabel('Cumulative Return')
-        plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        return self.plot_to_base64(plt), weights_df
+        return "Cumulative returns printed", weights_df
 
     def plot_crisis_performance(self, returns, benchmark_returns_dict, results, start_date, end_date, earliest_dates, fig_size=(10, 6)):
-        """Plot COVID-19 crisis performance, including Sortino-optimized portfolio, and return as base64."""
+        """Compute and print COVID-19 crisis performance metrics instead of plotting."""
         covid_period = ("2020-02-01", "2020-04-30")
         covid_start = pd.to_datetime("2020-02-01")
-        fig, ax = plt.subplots(figsize=fig_size)
         
         # Identify stocks with data before COVID-19 start
         tickers = returns.columns
@@ -230,8 +236,10 @@ class PortfolioAnalyzer:
         print(f"Debug: Valid tickers (data before {covid_start}): {valid_tickers}")
         print(f"Debug: Excluded tickers (data after {covid_start}): {excluded_tickers}")
 
+        print("\n**COVID-19 Crisis Performance Metrics (2020-02-01 to 2020-04-30):**")
+
         if not valid_tickers:
-            print("⚠️ No stocks in the portfolio have data before the COVID-19 period (2020-02-01). Skipping portfolio plotting.")
+            print("⚠️ No stocks in the portfolio have data before the COVID-19 period (2020-02-01). Skipping portfolio metrics.")
         else:
             # Fetch stock prices specifically for the COVID-19 period for valid tickers
             print(f"Fetching stock data for valid tickers {valid_tickers} for COVID-19 period...")
@@ -268,7 +276,10 @@ class PortfolioAnalyzer:
                     print(f"Debug: Original portfolio returns head:\n{cur_portfolio_returns.head()}")
                     if not cur_portfolio_returns.empty and cur_portfolio_returns.notna().any():
                         cur_cumulative = (1 + cur_portfolio_returns).cumprod() - 1
-                        ax.plot(cur_cumulative.index, cur_cumulative, label="Original Portfolio (COVID)", linestyle='--', linewidth=2)
+                        print("\n--- Original Portfolio (COVID) ---")
+                        print(f"Final Cumulative Return: {cur_cumulative.iloc[-1]:.2%}")
+                        print(f"Max Cumulative Return: {cur_cumulative.max():.2%}")
+                        print(f"Min Cumulative Return: {cur_cumulative.min():.2%}")
                     else:
                         print("⚠️ No valid returns calculated for Original Portfolio (empty or all NaN).")
 
@@ -288,7 +299,10 @@ class PortfolioAnalyzer:
                     print(f"Debug: Sharpe-Optimized portfolio returns head:\n{opt_portfolio_returns.head()}")
                     if not opt_portfolio_returns.empty and opt_portfolio_returns.notna().any():
                         opt_cumulative = (1 + opt_portfolio_returns).cumprod() - 1
-                        ax.plot(opt_cumulative.index, opt_cumulative, label="Optimized Portfolio (Max Sharpe, COVID)", linestyle='-.', linewidth=2)
+                        print("\n--- Optimized Portfolio (Max Sharpe, COVID) ---")
+                        print(f"Final Cumulative Return: {opt_cumulative.iloc[-1]:.2%}")
+                        print(f"Max Cumulative Return: {opt_cumulative.max():.2%}")
+                        print(f"Min Cumulative Return: {opt_cumulative.min():.2%}")
                     else:
                         print("⚠️ No valid returns calculated for Sharpe-Optimized Portfolio (empty or all NaN).")
 
@@ -308,25 +322,24 @@ class PortfolioAnalyzer:
                     print(f"Debug: Sortino-Optimized portfolio returns head:\n{sortino_opt_portfolio_returns.head()}")
                     if not sortino_opt_portfolio_returns.empty and sortino_opt_portfolio_returns.notna().any():
                         sortino_opt_cumulative = (1 + sortino_opt_portfolio_returns).cumprod() - 1
-                        ax.plot(sortino_opt_cumulative.index, sortino_opt_cumulative, label="Optimized Portfolio (Max Sortino, COVID)", linestyle=':', linewidth=2)
+                        print("\n--- Optimized Portfolio (Max Sortino, COVID) ---")
+                        print(f"Final Cumulative Return: {sortino_opt_cumulative.iloc[-1]:.2%}")
+                        print(f"Max Cumulative Return: {sortino_opt_cumulative.max():.2%}")
+                        print(f"Min Cumulative Return: {sortino_opt_cumulative.min():.2%}")
                     else:
                         print("⚠️ No valid returns calculated for Sortino-Optimized Portfolio (empty or all NaN).")
 
-        # Plot benchmarks
+        # Compute benchmarks
         for bench_ticker, bench_series in benchmark_returns_dict.items():
             bench_crisis = bench_series.loc[covid_period[0]:covid_period[1]]
             if not bench_crisis.empty:
                 bench_cumulative = (1 + bench_crisis).cumprod() - 1
-                ax.plot(bench_crisis.index, bench_cumulative, label=f"{bench_ticker} (COVID)", linestyle='-', linewidth=2)
+                print(f"\n--- {bench_ticker} (COVID) ---")
+                print(f"Final Cumulative Return: {bench_cumulative.iloc[-1]:.2%}")
+                print(f"Max Cumulative Return: {bench_cumulative.max():.2%}")
+                print(f"Min Cumulative Return: {bench_cumulative.min():.2%}")
 
-        ax.set_title("COVID-19 Crisis Performance Comparison")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Cumulative Return")
-        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        fig.tight_layout()
-        return self.plot_to_base64(plt)
+        return "Crisis performance metrics printed"
 
     def analyze_portfolio(self, tickers, weights=None, start_date=None, end_date=None, benchmark='^GSPC'):
         """Analyze a portfolio of stocks, including Sortino Ratio and Sortino-optimized portfolio."""
@@ -431,7 +444,7 @@ class PortfolioAnalyzer:
         return result
 
     def plot_efficient_frontier(self, returns, n_portfolios=1000, risk_free_rate=0.02, fig_size=(10, 6)):
-        """Plot the efficient frontier with Sharpe and Sortino Ratios and return as base64."""
+        """Compute and print efficient frontier metrics instead of plotting."""
         np.random.seed(42)
         n_assets = returns.shape[1]
         all_weights = np.zeros((n_portfolios, n_assets))
@@ -448,6 +461,7 @@ class PortfolioAnalyzer:
             all_volatilities[i] = port_vol
             all_sharpe_ratios[i] = port_sharpe
             all_sortino_ratios[i] = port_sortino
+
         optimal_weights = self.optimize_portfolio(returns, objective='sharpe')
         opt_return, opt_vol, opt_sharpe, opt_sortino = self.portfolio_performance(optimal_weights, returns)
         sortino_optimal_weights = self.optimize_portfolio(returns, objective='sortino')
@@ -456,49 +470,51 @@ class PortfolioAnalyzer:
         min_vol_return, min_vol_vol, min_vol_sharpe, min_vol_sortino = self.portfolio_performance(min_vol_weights, returns)
         equal_weights = np.ones(n_assets) / n_assets
         eq_return, eq_vol, eq_sharpe, eq_sortino = self.portfolio_performance(equal_weights, returns)
-        plt.figure(figsize=fig_size)
-        scatter = plt.scatter(all_volatilities, all_returns, c=all_sharpe_ratios, cmap='viridis', alpha=0.5)
-        plt.colorbar(label='Sharpe Ratio')
-        plt.scatter(opt_vol, opt_return, c='red', marker='o', s=100, edgecolors='black', linewidths=1.0, label='Optimal Portfolio (Max Sharpe)')
-        plt.scatter(sortino_opt_vol, sortino_opt_return, c='purple', marker='*', s=100, edgecolors='black', linewidths=1.0, label='Optimal Portfolio (Max Sortino)')
-        plt.scatter(min_vol_vol, min_vol_return, c='darkgreen', marker='^', s=100, edgecolors='black', linewidths=1.0, label='Minimum Volatility')
-        plt.scatter(eq_vol, eq_return, c='blue', marker='s', s=100, edgecolors='black', linewidths=1.0, label='Equal Weight')
-        plt.plot([0, opt_vol*1.5], [risk_free_rate, risk_free_rate + opt_sharpe*opt_vol*1.5], 'k--', label='Capital Market Line')
-        plt.xlabel('Annualized Volatility')
-        plt.ylabel('Annualized Return')
-        plt.title('Efficient Frontier')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        text_str = (f"Optimal (Sharpe): Return={opt_return:.2%}, Vol={opt_vol:.2%}, SR={opt_sharpe:.2f}, Sortino={opt_sortino:.2f}    |    "
-                    f"Optimal (Sortino): Return={sortino_opt_return:.2%}, Vol={sortino_opt_vol:.2%}, SR={sortino_opt_sharpe:.2f}, Sortino={sortino_opt_sortino:.2f}    |    "
-                    f"MinVol: Return={min_vol_return:.2%}, Vol={min_vol_vol:.2%}, SR={min_vol_sharpe:.2f}, Sortino={min_vol_sortino:.2f}    |    "
-                    f"Equal: Return={eq_return:.2%}, Vol={eq_vol:.2%}, SR={eq_sharpe:.2f}, Sortino={eq_sortino:.2f}")
-        plt.figtext(0.5, 0.005, text_str, ha='center', fontsize=9, wrap=True)
-        return self.plot_to_base64(plt)
+
+        print("\n**Efficient Frontier Metrics:**")
+        print("\n--- Optimal Portfolio (Max Sharpe) ---")
+        print(f"Return: {opt_return:.2%}")
+        print(f"Volatility: {opt_vol:.2%}")
+        print(f"Sharpe Ratio: {opt_sharpe:.2f}")
+        print(f"Sortino Ratio: {opt_sortino:.2f}")
+
+        print("\n--- Optimal Portfolio (Max Sortino) ---")
+        print(f"Return: {sortino_opt_return:.2%}")
+        print(f"Volatility: {sortino_opt_vol:.2%}")
+        print(f"Sharpe Ratio: {sortino_opt_sharpe:.2f}")
+        print(f"Sortino Ratio: {sortino_opt_sortino:.2f}")
+
+        print("\n--- Minimum Volatility Portfolio ---")
+        print(f"Return: {min_vol_return:.2%}")
+        print(f"Volatility: {min_vol_vol:.2%}")
+        print(f"Sharpe Ratio: {min_vol_sharpe:.2f}")
+        print(f"Sortino Ratio: {min_vol_sortino:.2f}")
+
+        print("\n--- Equal Weight Portfolio ---")
+        print(f"Return: {eq_return:.2%}")
+        print(f"Volatility: {eq_vol:.2%}")
+        print(f"Sharpe Ratio: {eq_sharpe:.2f}")
+        print(f"Sortino Ratio: {eq_sortino:.2f}")
+
+        print("\n--- Simulated Portfolios (Summary) ---")
+        print(f"Average Return: {np.mean(all_returns):.2%}")
+        print(f"Average Volatility: {np.mean(all_volatilities):.2%}")
+        print(f"Average Sharpe Ratio: {np.mean(all_sharpe_ratios):.2f}")
+        print(f"Average Sortino Ratio: {np.mean(all_sortino_ratios):.2f}")
+        print(f"Max Sharpe Ratio: {np.max(all_sharpe_ratios):.2f}")
+        print(f"Max Sortino Ratio: {np.max(all_sortino_ratios):.2f}")
+
+        return "Efficient frontier metrics printed"
 
     def plot_portfolio_weights(self, weights_dict, title="Portfolio Weights", fig_size=(10, 6), ax=None):
-        """Plot portfolio weights as a bar chart and return as base64 if standalone."""
-        tickers = list(weights_dict.keys())
-        weights = [weights_dict[ticker] for ticker in tickers]
-        if ax is None:
-            plt.figure(figsize=fig_size)
-            ax = plt.gca()
-        bars = ax.bar(tickers, weights)
-        ax.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height, f'{height:.1%}', ha='center', va='bottom')
-        ax.set_title(title)
-        ax.set_ylabel('Weight')
-        ax.set_xticklabels(tickers, rotation=45)
-        if ax == plt.gca():
-            plt.tight_layout()
-            return self.plot_to_base64(plt)
-        return ax
+        """Print portfolio weights instead of plotting."""
+        print(f"\n**{title}:**")
+        for ticker, weight in weights_dict.items():
+            print(f"{ticker}: {weight:.1%}")
+        return "Portfolio weights printed"
 
 def run_portfolio_analysis(tickers, weights=None, start_date=None, end_date=None, benchmark_tickers=['^GSPC']):
-    """Run a complete portfolio analysis with visualizations, including Sortino Ratio and Sortino-optimized portfolio."""
+    """Run a complete portfolio analysis with metrics printed instead of visualizations."""
     analyzer = PortfolioAnalyzer()
     results = analyzer.analyze_portfolio(tickers, weights, start_date, end_date, benchmark=benchmark_tickers[0])
     if 'error' in results:
@@ -570,46 +586,42 @@ def run_portfolio_analysis(tickers, weights=None, start_date=None, end_date=None
             benchmark_data[bench_ticker] = data
             benchmark_returns_dict[bench_ticker] = analyzer.compute_returns(data).iloc[:, 0]
 
-    print("\nGenerating plots...")
+    print("\nComputing metrics...")
 
     # 1. Correlation Matrix
-    corr_plot = analyzer.plot_correlation_matrix(stock_prices)
+    corr_metrics = analyzer.plot_correlation_matrix(stock_prices)
     corr_explanation = (
-        "\n**Correlation Matrix Plot Explanation:**\n"
-        "This heatmap displays the correlation coefficients among the stocks in your portfolio.\n"
+        "\n**Correlation Matrix Explanation:**\n"
+        "The printed correlation matrix displays the correlation coefficients among the stocks in your portfolio.\n"
         "High positive correlations (close to 1) indicate stocks move together, while negative values indicate inverse relationships.\n"
         "This helps assess diversification."
     )
 
     # 2. Efficient Frontier
-    ef_plot = analyzer.plot_efficient_frontier(returns_data)
+    ef_metrics = analyzer.plot_efficient_frontier(returns_data)
     ef_explanation = (
-        "\n**Efficient Frontier Plot Explanation:**\n"
-        "This plot shows the risk-return trade-off across thousands of simulated portfolio compositions.\n"
-        "The x-axis represents annualized volatility (risk) and the y-axis represents annualized return.\n"
-        "Each dot is a unique portfolio; the red circle marks the portfolio with the highest Sharpe Ratio,\n"
-        "the purple star marks the portfolio with the highest Sortino Ratio,\n"
-        "the dark green triangle indicates the portfolio with the lowest volatility, and the blue square represents an equal-weight portfolio.\n"
-        "Key metrics, including both Sharpe and Sortino Ratios, for these portfolios are displayed at the bottom of the plot.\n"
+        "\n**Efficient Frontier Metrics Explanation:**\n"
+        "The printed metrics show the risk-return trade-off for key portfolios.\n"
+        "Metrics include the optimal portfolio maximizing Sharpe Ratio, the optimal portfolio maximizing Sortino Ratio,\n"
+        "the minimum volatility portfolio, and an equal-weight portfolio.\n"
+        "A summary of simulated portfolios provides average returns, volatilities, and ratios.\n"
         "The Sortino Ratio focuses on downside risk, providing insight into how the portfolio handles negative returns compared to the Sharpe Ratio."
     )
 
-    # 3. Portfolio Weights Plots (Current, Sharpe-Optimized, Sortino-Optimized)
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
-    analyzer.plot_portfolio_weights(current['weights'], "Current Portfolio Weights", ax=ax1)
-    analyzer.plot_portfolio_weights(optimized['weights'], "Optimized Portfolio Weights (Max Sharpe)", ax=ax2)
-    analyzer.plot_portfolio_weights(sortino_optimized['weights'], "Optimized Portfolio Weights (Max Sortino)", ax=ax3)
-    plt.tight_layout()
-    weights_plot = analyzer.plot_to_base64(plt)
+    # 3. Portfolio Weights (Current, Sharpe-Optimized, Sortino-Optimized)
+    print("\n**Portfolio Weights Metrics:**")
+    weights_metrics_current = analyzer.plot_portfolio_weights(current['weights'], "Current Portfolio Weights")
+    weights_metrics_optimized = analyzer.plot_portfolio_weights(optimized['weights'], "Optimized Portfolio Weights (Max Sharpe)")
+    weights_metrics_sortino = analyzer.plot_portfolio_weights(sortino_optimized['weights'], "Optimized Portfolio Weights (Max Sortino)")
     weights_explanation = (
-        "\n**Portfolio Weights Plot Explanation:**\n"
-        "These bar charts show your portfolio's asset allocation for the current, Sharpe-optimized, and Sortino-optimized portfolios,\n"
+        "\n**Portfolio Weights Explanation:**\n"
+        "The printed weights show your portfolio's asset allocation for the current, Sharpe-optimized, and Sortino-optimized portfolios,\n"
         "highlighting how the allocation shifts to improve risk-adjusted performance.\n"
         "With the minimum investment set to 0%, the optimized portfolios may exclude some assets entirely to maximize their respective objectives."
     )
 
-    # 4. Cumulative Returns Plot
-    cum_plot, weights_df = analyzer.plot_cumulative_returns(
+    # 4. Cumulative Returns Metrics
+    cum_metrics, weights_df = analyzer.plot_cumulative_returns(
         returns_data, 
         np.array(list(current['weights'].values())),
         benchmark_returns=benchmark_returns_dict,
@@ -621,27 +633,27 @@ def run_portfolio_analysis(tickers, weights=None, start_date=None, end_date=None
     delayed_stocks = {t: d.strftime('%Y-%m-%d') for t, d in earliest_dates.items() if d > pd.to_datetime(start_date)}
     effective_start = max([d for d in earliest_dates.values()] + [pd.to_datetime(start_date)]).strftime('%Y-%m-%d')
     cum_explanation = (
-        "\n**Cumulative Returns Plot Explanation:**\n"
-        f"This plot shows cumulative returns starting from {effective_start}, normalized to 0%.\n"
+        "\n**Cumulative Returns Metrics Explanation:**\n"
+        f"The printed metrics show cumulative returns starting from {effective_start}, normalized to 0%.\n"
     )
     if delayed_stocks:
         cum_explanation += (
-            "Some stocks lacked data back to the user-specified start date and adjusted the plot's start:\n"
+            "Some stocks lacked data back to the user-specified start date and adjusted the metrics' start:\n"
         )
         for ticker, date in delayed_stocks.items():
             cum_explanation += f"  - {ticker}: Data starts {date}\n"
         cum_explanation += (
-            f"The plot begins at {effective_start}, the most recent earliest available date, ensuring all portfolio stocks are included.\n"
+            f"The metrics begin at {effective_start}, the most recent earliest available date, ensuring all portfolio stocks are included.\n"
             "Weights were dynamically adjusted as stocks became available, maintaining portfolio consistency.\n"
         )
     cum_explanation += (
-        "The current portfolio is a solid line, the Sharpe-optimized portfolio is dashed, the Sortino-optimized portfolio is dash-dotted, and benchmarks are solid with unique labels.\n"
-        "The y-axis shows cumulative returns as percentages (e.g., 150% means 1.5x initial value).\n"
+        "The metrics include final, maximum, and minimum cumulative returns for the current portfolio, Sharpe-optimized portfolio, Sortino-optimized portfolio, and benchmarks.\n"
+        "Cumulative returns are shown as percentages (e.g., 150% means 1.5x initial value).\n"
         f"The Sharpe-optimized portfolio's Sortino Ratio ({optimized['sortino_ratio']:.2f}) and the Sortino-optimized portfolio's Sortino Ratio ({sortino_optimized['sortino_ratio']:.2f}) indicate their performance in managing downside risk over this period."
     )
 
-    # 5. Crisis Performance Comparison Plot (COVID-19 only)
-    crisis_plot = analyzer.plot_crisis_performance(
+    # 5. Crisis Performance Metrics (COVID-19 only)
+    crisis_metrics = analyzer.plot_crisis_performance(
         returns_data, 
         benchmark_returns_dict, 
         results, 
@@ -652,9 +664,9 @@ def run_portfolio_analysis(tickers, weights=None, start_date=None, end_date=None
     covid_start = pd.to_datetime("2020-02-01")
     late_stocks = {t: d.strftime('%Y-%m-%d') for t, d in earliest_dates.items() if d >= covid_start}
     crisis_explanation = (
-        "\n**COVID-19 Impact Plot Explanation:**\n"
-        "This graph illustrates the performance of your portfolio and selected benchmarks during the COVID-19 crisis (2020-02-01 to 2020-04-30).\n"
-        "It includes the original portfolio (dashed line), the Sharpe-optimized portfolio (dash-dot line), the Sortino-optimized portfolio (dotted line), and benchmarks (solid lines), all normalized to start at 0%.\n"
+        "\n**COVID-19 Impact Metrics Explanation:**\n"
+        "The printed metrics illustrate the performance of your portfolio and selected benchmarks during the COVID-19 crisis (2020-02-01 to 2020-04-30).\n"
+        "Metrics include final, maximum, and minimum cumulative returns for the original portfolio, Sharpe-optimized portfolio, Sortino-optimized portfolio, and benchmarks, all normalized to start at 0%.\n"
     )
     if late_stocks:
         crisis_explanation += (
@@ -663,34 +675,34 @@ def run_portfolio_analysis(tickers, weights=None, start_date=None, end_date=None
         for ticker, date in late_stocks.items():
             crisis_explanation += f"  - {ticker}: Data starts {date}\n"
         crisis_explanation += (
-            "Only stocks with data before this date contribute to the portfolio lines, with weights redistributed accordingly.\n"
+            "Only stocks with data before this date contribute to the portfolio metrics, with weights redistributed accordingly.\n"
         )
     else:
         crisis_explanation += (
             "All stocks had sufficient price data before the COVID-19 period, so no exclusions were necessary.\n"
         )
     crisis_explanation += (
-        "The y-axis shows cumulative returns as percentages, highlighting performance during the crisis.\n"
+        "The metrics show cumulative returns as percentages, highlighting performance during the crisis.\n"
         f"The Sharpe-optimized portfolio's Sortino Ratio ({optimized['sortino_ratio']:.2f}) and the Sortino-optimized portfolio's Sortino Ratio ({sortino_optimized['sortino_ratio']:.2f}) reflect their ability to mitigate downside risk during this volatile period, compared to their Sharpe Ratios ({optimized['sharpe_ratio']:.2f} and {results['sortino_optimized_portfolio']['sharpe_ratio']:.2f})."
     )
 
     print("\n===== ORIGINAL PORTFOLIO ANALYSIS INSIGHTS =====")
-    print("• The efficient frontier indicates that your current portfolio has a moderate Sharpe ratio, suggesting room for enhanced risk-adjusted returns.")
+    print("• The efficient frontier metrics indicate that your current portfolio has a moderate Sharpe ratio, suggesting room for enhanced risk-adjusted returns.")
     print(f"• The Sortino Ratio ({current['sortino_ratio']:.2f}) highlights the portfolio's exposure to downside risk, which may be more relevant if you're concerned about losses rather than overall volatility (Sharpe: {current['sharpe_ratio']:.2f}).")
-    print("• The cumulative returns plot reveals that while your portfolio has grown, there have been periods of underperformance relative to benchmarks.")
-    print("• The COVID-19 performance analysis shows significant drawdowns, highlighting sensitivity during market stress, which aligns with the Sortino Ratio's focus on downside risk.")
+    print("• The cumulative returns metrics reveal that while your portfolio has grown, there have been periods of underperformance relative to benchmarks.")
+    print("• The COVID-19 performance metrics show significant drawdowns, highlighting sensitivity during market stress, which aligns with the Sortino Ratio's focus on downside risk.")
 
     print("\n===== OPTIMIZED PORTFOLIO (MAX SHARPE) ANALYSIS INSIGHTS =====")
     print("• The Sharpe-optimized portfolio adjusts weights to maximize the Sharpe ratio, reflecting improved risk-adjusted returns.")
     print(f"• Its Sortino Ratio ({optimized['sortino_ratio']:.2f}) indicates its performance in managing downside risk compared to the original portfolio (Sortino: {current['sortino_ratio']:.2f}).")
-    print("• The rebalanced asset allocation (as seen in the weights plots) indicates a shift toward assets that optimize total risk-adjusted returns, with some assets potentially excluded (0% weight).")
+    print("• The rebalanced asset allocation (as seen in the weights metrics) indicates a shift toward assets that optimize total risk-adjusted returns, with some assets potentially excluded (0% weight).")
     print("• The Sharpe-optimized portfolio shows different cumulative returns and drawdowns during the COVID-19 crisis compared to the original portfolio, reflecting its focus on total volatility.")
 
     print("\n===== OPTIMIZED PORTFOLIO (MAX SORTINO) ANALYSIS INSIGHTS =====")
     print("• The Sortino-optimized portfolio adjusts weights to maximize the Sortino ratio, focusing on minimizing downside risk.")
     print(f"• Its Sortino Ratio ({sortino_optimized['sortino_ratio']:.2f}) is optimized, indicating superior management of downside risk compared to the original (Sortino: {current['sortino_ratio']:.2f}) and Sharpe-optimized portfolios (Sortino: {optimized['sortino_ratio']:.2f}).")
-    print("• The rebalanced asset allocation (as seen in the weights plots) prioritizes assets that reduce negative returns, with some assets potentially excluded (0% weight).")
-    print("• The Sortino-optimized portfolio may show more resilience during the COVID-19 crisis, as seen in the crisis performance plot, due to its focus on downside risk.")
+    print("• The rebalanced asset allocation (as seen in the weights metrics) prioritizes assets that reduce negative returns, with some assets potentially excluded (0% weight).")
+    print("• The Sortino-optimized portfolio may show more resilience during the COVID-19 crisis, as seen in the crisis performance metrics, due to its focus on downside risk.")
 
     print("\n===== APPENDIX =====")
     print("Key Formulas and Data Metric Explanations:")
@@ -709,13 +721,15 @@ def run_portfolio_analysis(tickers, weights=None, start_date=None, end_date=None
     print("7. Portfolio Return = Dot product of portfolio weights and mean daily returns, annualized by multiplying by 252")
     print("8. Optimization uses the SLSQP method with constraints that ensure weights sum to 1, each weight is capped (default 25%), and minimum investment is 0%.")
 
-    # Add plots and explanations to results
-    results['plots'] = {
-        'correlation_matrix': corr_plot,
-        'efficient_frontier': ef_plot,
-        'portfolio_weights': weights_plot,
-        'cumulative_returns': cum_plot,
-        'crisis_performance': crisis_plot
+    # Add metrics and explanations to results (no plots)
+    results['metrics'] = {
+        'correlation_matrix': corr_metrics,
+        'efficient_frontier': ef_metrics,
+        'portfolio_weights_current': weights_metrics_current,
+        'portfolio_weights_optimized': weights_metrics_optimized,
+        'portfolio_weights_sortino': weights_metrics_sortino,
+        'cumulative_returns': cum_metrics,
+        'crisis_performance': crisis_metrics
     }
     results['explanations'] = {
         'correlation_matrix': corr_explanation,
