@@ -1,6 +1,3 @@
-# Install required package
-# !pip install yfinance  # Removed for production; ensure installed via requirements.txt
-
 import yfinance as yf
 import numpy as np
 import pandas as pd
@@ -9,801 +6,738 @@ import seaborn as sns
 from scipy.optimize import minimize
 from datetime import datetime, timedelta
 import warnings
-import io
-import base64
-from flask import Flask, request, jsonify
 warnings.filterwarnings('ignore')
 from matplotlib.ticker import PercentFormatter
 
-app = Flask(__name__)
-
 class PortfolioAnalyzer:
     def __init__(self):
-        self.today_date = datetime.today().strftime("%Y-%m-%d")
-        self.default_start_date = "2015-01-01"
-        self.risk_free_rate = 0.02  # Risk-free rate for Sharpe and Sortino calculations
+        self.today_date = datetime.now().strftime("%Y-%m-%d")  # Use current date dynamically
+        self.default_start_date = (datetime.strptime(self.today_date, "%Y-%m-%d") - timedelta(days=3652)).strftime("%Y-%m-%d")  # 10 years ago
+        self.data_cache = {}  # In-memory cache for stock data
+
+    def fetch_treasury_yield(self):
+        """Fetch the current 10-year U.S. Treasury yield using ^TNX."""
+        try:
+            treasury_data = yf.download("^TNX", period="1d", interval="1d")['Close']
+            if treasury_data.empty or not isinstance(treasury_data, pd.Series):
+                print("Warning: Could not fetch 10-year Treasury yield. Using fallback value of 0.04 (4%).")
+                return 0.04
+            latest_yield = float(treasury_data.iloc[-1]) / 100  # Explicitly convert to float and scale to decimal
+            return latest_yield
+        except Exception as e:
+            print(f"Error fetching Treasury yield: {e}. Using fallback value of 0.04 (4%).")
+            return 0.04
 
     def fetch_stock_data(self, stocks, start=None, end=None):
-        """Fetch stock data with error handling and track earliest available date."""
         if start is None:
             start = self.default_start_date
         if end is None:
             end = self.today_date
+        cache_key = (tuple(sorted(stocks)), start, end)  # Unique key for caching
+        if cache_key in self.data_cache:
+            return self.data_cache[cache_key]  # Return cached data if available
         error_tickers = {}
         earliest_dates = {}
-        stock_data = yf.download(stocks, start=start, end=end, auto_adjust=True)
-        if stock_data.empty:
-            print("⚠️ No data available for the specified date range.")
-            return None, error_tickers, earliest_dates
-        stock_data = stock_data['Close']
-        for ticker in stocks:
-            if ticker not in stock_data.columns or stock_data[ticker].isna().all():
-                error_tickers[ticker] = "Data not available"
-            else:
-                first_valid = stock_data[ticker].first_valid_index()
-                if first_valid:
-                    earliest_dates[ticker] = first_valid
+        try:
+            stock_data = yf.download(list(stocks), start=start, end=end, auto_adjust=True)['Close']
+            if stock_data.empty:
+                print("Warning: No data available for the specified date range.")
+                return None, error_tickers, earliest_dates
+            for ticker in stocks:
+                if ticker not in stock_data.columns or stock_data[ticker].isna().all():
+                    error_tickers[ticker] = "Data not available"
                 else:
-                    error_tickers[ticker] = "No valid data points"
-                    stock_data = stock_data.drop(columns=[ticker])
-        return stock_data, error_tickers, earliest_dates
+                    first_valid = stock_data[ticker].first_valid_index()
+                    earliest_dates[ticker] = first_valid
+            self.data_cache[cache_key] = (stock_data, error_tickers, earliest_dates)  # Cache the result
+            return stock_data, error_tickers, earliest_dates
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            return None, error_tickers, earliest_dates
 
     def compute_returns(self, prices):
-        """Compute daily returns from price data"""
         return prices.pct_change().dropna()
 
-    def compute_max_drawdown(self, series):
-        """Compute maximum drawdown for a cumulative return series"""
-        running_max = series.cummax()
-        drawdown = (series - running_max) / running_max
+    def compute_max_drawdown(self, returns):
+        cumulative = (1 + returns).cumprod()
+        running_max = cumulative.cummax()
+        drawdown = (cumulative - running_max) / running_max
         return drawdown.min()
 
-    def compute_downside_deviation(self, returns, target=0):
-        """Compute downside deviation for Sortino Ratio (standard deviation of negative returns)."""
-        negative_returns = returns[returns < target]
-        if len(negative_returns) == 0:
-            return 0
-        return np.std(negative_returns) * np.sqrt(252)  # Annualized
+    def compute_sortino_ratio(self, returns, risk_free_rate):
+        downside_returns = returns[returns < 0]
+        downside_std = downside_returns.std() * np.sqrt(252)
+        annualized_return = returns.mean() * 252
+        return (annualized_return - risk_free_rate) / downside_std if downside_std != 0 else 0
 
-    def portfolio_performance(self, weights, returns):
-        """Calculate portfolio performance metrics including Sharpe and Sortino Ratios."""
-        portfolio_return = np.sum(weights * returns.mean()) * 252
+    def compute_beta(self, portfolio_returns, benchmark_returns):
+        covariance = portfolio_returns.cov(benchmark_returns)
+        benchmark_variance = benchmark_returns.var()
+        return covariance / benchmark_variance if benchmark_variance != 0 else 0
+
+    def portfolio_performance(self, weights, returns, risk_free_rate):
+        portfolio_returns = returns.dot(weights)
+        portfolio_return = portfolio_returns.mean() * 252
         portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(returns.cov() * 252, weights)))
-        sharpe_ratio = (portfolio_return - self.risk_free_rate) / portfolio_volatility if portfolio_volatility != 0 else 0
-        
-        # Compute portfolio daily returns for Sortino
-        portfolio_daily_returns = returns.dot(weights)
-        downside_dev = self.compute_downside_deviation(portfolio_daily_returns, target=0)
-        sortino_ratio = (portfolio_return - self.risk_free_rate) / downside_dev if downside_dev != 0 else 0
-        
-        return portfolio_return, portfolio_volatility, sharpe_ratio, sortino_ratio
+        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility if portfolio_volatility != 0 else 0
+        return portfolio_return, portfolio_volatility, sharpe_ratio
 
-    def optimize_portfolio(self, returns, objective='sharpe', max_allocation=1):
-        """Optimize portfolio based on different objectives with minimum investment at 0%."""
+    def compute_var(self, returns, confidence_level=0.90):
+        sorted_returns = np.sort(returns)
+        index = int((1 - confidence_level) * len(sorted_returns))
+        return sorted_returns[index] if len(sorted_returns) > 0 else 0
+
+    def optimize_portfolio(self, returns, risk_free_rate, objective='sharpe', min_allocation=0.0, max_allocation=1.0):
         num_assets = returns.shape[1]
         initial_weights = np.ones(num_assets) / num_assets
         constraints = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
-        bounds = tuple((0, max_allocation) for _ in range(num_assets))  # Minimum is 0%
+        bounds = tuple((min_allocation, max_allocation) for _ in range(num_assets))
 
-        def negative_sharpe(weights, returns):
-            portfolio_return, portfolio_volatility, sharpe, _ = self.portfolio_performance(weights, returns)
-            return -sharpe
+        def negative_sharpe(weights):
+            r, v, s = self.portfolio_performance(weights, returns, risk_free_rate)
+            return -s
 
-        def negative_sortino(weights, returns):
-            portfolio_return, _, _, sortino = self.portfolio_performance(weights, returns)
-            return -sortino
+        def negative_sortino(weights):
+            portfolio_returns = returns.dot(weights)
+            return -self.compute_sortino_ratio(portfolio_returns, risk_free_rate)
 
-        def portfolio_volatility(weights, returns):
+        def max_drawdown(weights):
+            portfolio_returns = returns.dot(weights)
+            return self.compute_max_drawdown(portfolio_returns)
+
+        def portfolio_volatility(weights):
             return np.sqrt(np.dot(weights.T, np.dot(returns.cov() * 252, weights)))
 
-        if objective == 'sharpe':
-            obj_fun = negative_sharpe
-            obj_args = (returns,)
-        elif objective == 'sortino':
-            obj_fun = negative_sortino
-            obj_args = (returns,)
-        elif objective == 'min_volatility':
-            obj_fun = portfolio_volatility
-            obj_args = (returns,)
-        else:
-            raise ValueError(f"Unknown optimization objective: {objective}")
+        def negative_var(weights):
+            portfolio_returns = returns.dot(weights)
+            return -self.compute_var(portfolio_returns)
+
+        objective_functions = {
+            'sharpe': negative_sharpe,
+            'sortino': negative_sortino,
+            'max_drawdown': max_drawdown,
+            'volatility': portfolio_volatility,
+            'value_at_risk': negative_var
+        }
+        obj_fun = objective_functions.get(objective, negative_sharpe)
 
         try:
-            optimal_results = minimize(
-                obj_fun, initial_weights, args=obj_args,
-                method='SLSQP', constraints=constraints, bounds=bounds
-            )
-            if not optimal_results.success:
-                print(f"⚠️ Optimization warning: {optimal_results.message}")
-            weights = optimal_results.x
-            weights[weights < 0.001] = 0  # Ensure small weights are set to 0
-            weights = weights / np.sum(weights) if np.sum(weights) != 0 else weights
+            result = minimize(obj_fun, initial_weights, method='SLSQP', bounds=bounds, constraints=constraints)
+            if not result.success:
+                print(f"Warning: Optimization failed for {objective}: {result.message}")
+                print("Suggestion: Try a different objective (e.g., 'sharpe') or check if your stocks have sufficient data.")
+                return initial_weights
+            weights = result.x
+            weights[weights < 0.001] = 0
+            weights /= weights.sum() if weights.sum() != 0 else 1
             return weights
         except Exception as e:
-            print(f"❌ Optimization error: {str(e)}")
+            print(f"Error in optimization: {e}")
             return initial_weights
 
-    def compute_var(self, returns, confidence_level=0.95, method='historical'):
-        """Compute Value at Risk (VaR) using historical simulation."""
-        sorted_returns = np.sort(returns)
-        index = int((1 - confidence_level) * len(sorted_returns))
-        var = sorted_returns[index]
-        return -var
+    def apply_weight_strategy(self, returns, strategy='equal'):
+        num_assets = returns.shape[1]
+        if strategy == 'equal':
+            return np.ones(num_assets) / num_assets
+        elif strategy == 'risk_parity':
+            volatilities = returns.std() * np.sqrt(252)
+            inv_vol = 1 / volatilities
+            return inv_vol / inv_vol.sum() if inv_vol.sum() != 0 else np.ones(num_assets) / num_assets
+        elif strategy == 'inverse_volatility':
+            volatilities = returns.std() * np.sqrt(252)
+            inv_vol = 1 / volatilities
+            return inv_vol / inv_vol.sum() if inv_vol.sum() != 0 else np.ones(num_assets) / num_assets
+        else:
+            return np.ones(num_assets) / num_assets
 
-    def plot_to_base64(self, plt):
-        """Convert matplotlib plot to base64 string."""
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight')
-        buf.seek(0)
-        img_str = base64.b64encode(buf.getvalue()).decode('utf-8')
-        buf.close()
-        plt.close()
-        return img_str
-
-    def plot_correlation_matrix(self, prices, fig_size=(10, 6)):
-        """Compute and print the correlation matrix of portfolio stocks instead of plotting."""
+    def print_correlation_matrix(self, prices):
         corr_matrix = prices.corr()
-        print("\n**Correlation Matrix of Portfolio Stocks:**")
+        print("\n===== Correlation Matrix of Portfolio Stocks =====")
+        print("Explanation: This table shows how your stocks move together. Values close to 1 mean strong positive correlation, while negative values mean they move oppositely.")
         print(corr_matrix.to_string(float_format="%.2f"))
-        return "Correlation matrix printed"
 
-    def adjust_weights_over_time(self, tickers, weights, returns):
-        """Adjust weights dynamically, ensuring alignment with returns data."""
-        ticker_list = list(tickers)  # Convert Index to list for indexing
-        weights_df = pd.DataFrame(index=returns.index, columns=tickers)
-        for date in returns.index:
-            active_tickers = [t for t in ticker_list if not returns[t].loc[:date].isna().all()]
-            if active_tickers:
-                total_weight = sum(weights[ticker_list.index(t)] for t in active_tickers)
-                for t in ticker_list:
-                    if t in active_tickers:
-                        weights_df.loc[date, t] = weights[ticker_list.index(t)] / total_weight if total_weight > 0 else 0
-                    else:
-                        weights_df.loc[date, t] = 0
-            else:
-                weights_df.loc[date, :] = 0
-        return weights_df.fillna(method='ffill')
-
-    def plot_cumulative_returns(self, returns, weights, benchmark_returns=None, optimized_weights=None, sortino_optimized_weights=None, earliest_dates=None, user_start_date=None, fig_size=(10, 6)):
-        """Compute and print cumulative returns metrics instead of plotting."""
-        earliest_date = max([d for d in earliest_dates.values()] + [pd.to_datetime(user_start_date)])
-        adjusted_returns = returns.loc[earliest_date:]
-        if adjusted_returns.empty:
-            print(f"⚠️ No data available after adjusting start date to {earliest_date.strftime('%Y-%m-%d')}.")
-            return None, None
-
-        tickers = returns.columns
-        weights_df = self.adjust_weights_over_time(tickers, weights, adjusted_returns)
-        portfolio_returns = (adjusted_returns * weights_df).sum(axis=1)
-        cumulative = (1 + portfolio_returns).cumprod() - 1
-
-        print(f"\n**Cumulative Returns Metrics (From {earliest_date.strftime('%Y-%m-%d')}):**")
-        print("\n--- Current Portfolio ---")
-        print(f"Final Cumulative Return: {cumulative.iloc[-1]:.2%}")
-        print(f"Max Cumulative Return: {cumulative.max():.2%}")
-        print(f"Min Cumulative Return: {cumulative.min():.2%}")
-
-        if optimized_weights is not None:
-            opt_weights_df = self.adjust_weights_over_time(tickers, optimized_weights, adjusted_returns)
-            opt_returns = (adjusted_returns * opt_weights_df).sum(axis=1)
-            opt_cumulative = (1 + opt_returns).cumprod() - 1
-            print("\n--- Optimized Portfolio (Max Sharpe) ---")
-            print(f"Final Cumulative Return: {opt_cumulative.iloc[-1]:.2%}")
-            print(f"Max Cumulative Return: {opt_cumulative.max():.2%}")
-            print(f"Min Cumulative Return: {opt_cumulative.min():.2%}")
-
-        if sortino_optimized_weights is not None:
-            sortino_opt_weights_df = self.adjust_weights_over_time(tickers, sortino_optimized_weights, adjusted_returns)
-            sortino_opt_returns = (adjusted_returns * sortino_opt_weights_df).sum(axis=1)
-            sortino_opt_cumulative = (1 + sortino_opt_returns).cumprod() - 1
-            print("\n--- Optimized Portfolio (Max Sortino) ---")
-            print(f"Final Cumulative Return: {sortino_opt_cumulative.iloc[-1]:.2%}")
-            print(f"Max Cumulative Return: {sortino_opt_cumulative.max():.2%}")
-            print(f"Min Cumulative Return: {sortino_opt_cumulative.min():.2%}")
-
-        if benchmark_returns is not None:
-            if isinstance(benchmark_returns, dict):
-                for key, series in benchmark_returns.items():
-                    bench_series = series.loc[earliest_date:]
-                    if not bench_series.empty:
-                        bench_cumulative = (1 + bench_series).cumprod() - 1
-                        print(f"\n--- Benchmark: {key} ---")
-                        print(f"Final Cumulative Return: {bench_cumulative.iloc[-1]:.2%}")
-                        print(f"Max Cumulative Return: {bench_cumulative.max():.2%}")
-                        print(f"Min Cumulative Return: {bench_cumulative.min():.2%}")
-            else:
-                bench_series = benchmark_returns.loc[earliest_date:]
-                if not bench_series.empty:
-                    bench_cumulative = (1 + bench_series).cumprod() - 1
-                    print("\n--- Benchmark ---")
-                    print(f"Final Cumulative Return: {bench_cumulative.iloc[-1]:.2%}")
-                    print(f"Max Cumulative Return: {bench_cumulative.max():.2%}")
-                    print(f"Min Cumulative Return: {bench_cumulative.min():.2%}")
-
-        return "Cumulative returns printed", weights_df
-
-    def plot_crisis_performance(self, returns, benchmark_returns_dict, results, start_date, end_date, earliest_dates, fig_size=(10, 6)):
-        """Compute and print COVID-19 crisis performance metrics instead of plotting."""
-        covid_period = ("2020-02-01", "2020-04-30")
-        covid_start = pd.to_datetime("2020-02-01")
-        
-        # Identify stocks with data before COVID-19 start
-        tickers = returns.columns
-        ticker_list = list(tickers)
-        valid_tickers = [t for t in ticker_list if earliest_dates.get(t, covid_start) < covid_start]
-        excluded_tickers = [t for t in ticker_list if t not in valid_tickers]
-
-        print(f"Debug: Valid tickers (data before {covid_start}): {valid_tickers}")
-        print(f"Debug: Excluded tickers (data after {covid_start}): {excluded_tickers}")
-
-        print("\n**COVID-19 Crisis Performance Metrics (2020-02-01 to 2020-04-30):**")
-
-        if not valid_tickers:
-            print("⚠️ No stocks in the portfolio have data before the COVID-19 period (2020-02-01). Skipping portfolio metrics.")
-        else:
-            # Fetch stock prices specifically for the COVID-19 period for valid tickers
-            print(f"Fetching stock data for valid tickers {valid_tickers} for COVID-19 period...")
-            crisis_prices, error_tickers, _ = self.fetch_stock_data(valid_tickers, start=covid_period[0], end=covid_period[1])
-            if crisis_prices is None or crisis_prices.empty:
-                print("⚠️ No price data available for valid tickers during the COVID-19 period.")
-            else:
-                # Compute returns for the crisis period
-                crisis_returns = self.compute_returns(crisis_prices)
-                print(f"Debug: crisis_returns shape: {crisis_returns.shape}, columns: {list(crisis_returns.columns)}")
-                print(f"Debug: crisis_returns head:\n{crisis_returns.head()}")
-                
-                if crisis_returns.empty:
-                    print("⚠️ No valid returns data for portfolios in COVID-19 period after computing returns.")
-                else:
-                    # Fill remaining NaNs with 0 to prevent issues in calculations
-                    crisis_returns = crisis_returns.fillna(0)
-                    print(f"Debug: crisis_returns after filling NaNs (shape: {crisis_returns.shape}, columns: {list(crisis_returns.columns)}")
-                    print(f"Debug: crisis_returns head after filling NaNs:\n{crisis_returns.head()}")
-                    
-                    # Redistribute weights for valid tickers (Current Portfolio)
-                    cur_weights_dict = results['current_portfolio']['weights']
-                    cur_weights = np.array([cur_weights_dict[t] for t in crisis_returns.columns])
-                    cur_weights_sum = cur_weights.sum()
-                    if cur_weights_sum > 0:
-                        cur_weights_adjusted = cur_weights / cur_weights_sum  # Normalize to sum to 1
-                    else:
-                        cur_weights_adjusted = cur_weights
-                        print("⚠️ Sum of weights for original portfolio is 0; using unnormalized weights.")
-                    
-                    # Current Portfolio
-                    cur_portfolio_returns = crisis_returns.mul(cur_weights_adjusted, axis=1).sum(axis=1)
-                    print(f"Debug: Original weights (normalized): {cur_weights_adjusted}")
-                    print(f"Debug: Original portfolio returns head:\n{cur_portfolio_returns.head()}")
-                    if not cur_portfolio_returns.empty and cur_portfolio_returns.notna().any():
-                        cur_cumulative = (1 + cur_portfolio_returns).cumprod() - 1
-                        print("\n--- Original Portfolio (COVID) ---")
-                        print(f"Final Cumulative Return: {cur_cumulative.iloc[-1]:.2%}")
-                        print(f"Max Cumulative Return: {cur_cumulative.max():.2%}")
-                        print(f"Min Cumulative Return: {cur_cumulative.min():.2%}")
-                    else:
-                        print("⚠️ No valid returns calculated for Original Portfolio (empty or all NaN).")
-
-                    # Redistribute weights for Sharpe-optimized portfolio
-                    opt_weights_dict = results['optimized_portfolio']['weights']
-                    opt_weights = np.array([opt_weights_dict[t] for t in crisis_returns.columns])
-                    opt_weights_sum = opt_weights.sum()
-                    if opt_weights_sum > 0:
-                        opt_weights_adjusted = opt_weights / opt_weights_sum  # Normalize to sum to 1
-                    else:
-                        opt_weights_adjusted = opt_weights
-                        print("⚠️ Sum of weights for Sharpe-optimized portfolio is 0; using unnormalized weights.")
-                    
-                    # Sharpe-Optimized Portfolio
-                    opt_portfolio_returns = crisis_returns.mul(opt_weights_adjusted, axis=1).sum(axis=1)
-                    print(f"Debug: Sharpe-Optimized weights (normalized): {opt_weights_adjusted}")
-                    print(f"Debug: Sharpe-Optimized portfolio returns head:\n{opt_portfolio_returns.head()}")
-                    if not opt_portfolio_returns.empty and opt_portfolio_returns.notna().any():
-                        opt_cumulative = (1 + opt_portfolio_returns).cumprod() - 1
-                        print("\n--- Optimized Portfolio (Max Sharpe, COVID) ---")
-                        print(f"Final Cumulative Return: {opt_cumulative.iloc[-1]:.2%}")
-                        print(f"Max Cumulative Return: {opt_cumulative.max():.2%}")
-                        print(f"Min Cumulative Return: {opt_cumulative.min():.2%}")
-                    else:
-                        print("⚠️ No valid returns calculated for Sharpe-Optimized Portfolio (empty or all NaN).")
-
-                    # Redistribute weights for Sortino-optimized portfolio
-                    sortino_opt_weights_dict = results['sortino_optimized_portfolio']['weights']
-                    sortino_opt_weights = np.array([sortino_opt_weights_dict[t] for t in crisis_returns.columns])
-                    sortino_opt_weights_sum = sortino_opt_weights.sum()
-                    if sortino_opt_weights_sum > 0:
-                        sortino_opt_weights_adjusted = sortino_opt_weights / sortino_opt_weights_sum  # Normalize to sum to 1
-                    else:
-                        sortino_opt_weights_adjusted = sortino_opt_weights
-                        print("⚠️ Sum of weights for Sortino-optimized portfolio is 0; using unnormalized weights.")
-                    
-                    # Sortino-Optimized Portfolio
-                    sortino_opt_portfolio_returns = crisis_returns.mul(sortino_opt_weights_adjusted, axis=1).sum(axis=1)
-                    print(f"Debug: Sortino-Optimized weights (normalized): {sortino_opt_weights_adjusted}")
-                    print(f"Debug: Sortino-Optimized portfolio returns head:\n{sortino_opt_portfolio_returns.head()}")
-                    if not sortino_opt_portfolio_returns.empty and sortino_opt_portfolio_returns.notna().any():
-                        sortino_opt_cumulative = (1 + sortino_opt_portfolio_returns).cumprod() - 1
-                        print("\n--- Optimized Portfolio (Max Sortino, COVID) ---")
-                        print(f"Final Cumulative Return: {sortino_opt_cumulative.iloc[-1]:.2%}")
-                        print(f"Max Cumulative Return: {sortino_opt_cumulative.max():.2%}")
-                        print(f"Min Cumulative Return: {sortino_opt_cumulative.min():.2%}")
-                    else:
-                        print("⚠️ No valid returns calculated for Sortino-Optimized Portfolio (empty or all NaN).")
-
-        # Compute benchmarks
-        for bench_ticker, bench_series in benchmark_returns_dict.items():
-            bench_crisis = bench_series.loc[covid_period[0]:covid_period[1]]
-            if not bench_crisis.empty:
-                bench_cumulative = (1 + bench_crisis).cumprod() - 1
-                print(f"\n--- {bench_ticker} (COVID) ---")
-                print(f"Final Cumulative Return: {bench_cumulative.iloc[-1]:.2%}")
-                print(f"Max Cumulative Return: {bench_cumulative.max():.2%}")
-                print(f"Min Cumulative Return: {bench_cumulative.min():.2%}")
-
-        return "Crisis performance metrics printed"
-
-    def analyze_portfolio(self, tickers, weights=None, start_date=None, end_date=None, benchmark='^GSPC'):
-        """Analyze a portfolio of stocks, including Sortino Ratio and Sortino-optimized portfolio."""
-        if start_date is None:
-            start_date = self.default_start_date
-        if end_date is None:
-            end_date = self.today_date
-        if weights is None:
-            weights = [1/len(tickers)] * len(tickers)
-        weights = np.array(weights) / sum(weights)
-        print(f"Fetching data for {len(tickers)} stocks...")
-        stock_prices, error_tickers, earliest_dates = self.fetch_stock_data(tickers, start=start_date, end=end_date)
-        if stock_prices is None or stock_prices.empty:
-            return {'error': 'No valid stock data available', 'error_tickers': error_tickers, 'earliest_dates': earliest_dates}
-        if error_tickers:
-            print(f"⚠️ Issues with {len(error_tickers)} tickers:")
-            for ticker, error in error_tickers.items():
-                print(f"  - {ticker}: {error}")
-        returns = self.compute_returns(stock_prices)
-        valid_tickers = list(returns.columns)
-        if len(valid_tickers) < len(tickers):
-            print(f"⚠️ {len(tickers) - len(valid_tickers)} tickers missing from data, adjusting weights...")
-            valid_idx = [i for i, t in enumerate(tickers) if t in valid_tickers]
-            weights = np.array([weights[i] for i in valid_idx])
-            weights = weights / np.sum(weights)
-            tickers = valid_tickers
-        if returns.shape[0] < 20:
-            return {'error': 'Insufficient data for analysis', 'earliest_dates': earliest_dates}
-        print(f"Fetching benchmark data: {benchmark}...")
-        benchmark_prices, _, _ = self.fetch_stock_data([benchmark], start=start_date, end=end_date)
-        if benchmark_prices is None or benchmark_prices.empty:
-            print(f"⚠️ Could not retrieve benchmark data for {benchmark}")
-            benchmark_returns = None
-        else:
-            benchmark_returns = self.compute_returns(benchmark_prices).iloc[:, 0]
-        portfolio_returns = returns.dot(weights)
-        annualized_return, annualized_volatility, sharpe_ratio, sortino_ratio = self.portfolio_performance(weights, returns)
-        max_drawdown = self.compute_max_drawdown((1 + portfolio_returns).cumprod())
-        if benchmark_returns is not None:
-            bench_return, bench_vol, bench_sharpe, bench_sortino = self.portfolio_performance(np.array([1.0]), pd.DataFrame(benchmark_returns))
-            benchmark_max_dd = self.compute_max_drawdown((1 + benchmark_returns).cumprod())
-        else:
-            bench_return = bench_vol = bench_sharpe = bench_sortino = benchmark_max_dd = None
-        optimal_weights = self.optimize_portfolio(returns, objective='sharpe', max_allocation=1)
-        opt_return, opt_volatility, opt_sharpe, opt_sortino = self.portfolio_performance(optimal_weights, returns)
-        opt_max_drawdown = self.compute_max_drawdown((1 + returns.dot(optimal_weights)).cumprod())
-        opt_var = self.compute_var(returns.dot(optimal_weights))
-        sortino_optimal_weights = self.optimize_portfolio(returns, objective='sortino', max_allocation=1)
-        sortino_opt_return, sortino_opt_volatility, sortino_opt_sharpe, sortino_opt_sortino = self.portfolio_performance(sortino_optimal_weights, returns)
-        sortino_opt_max_drawdown = self.compute_max_drawdown((1 + returns.dot(sortino_optimal_weights)).cumprod())
-        sortino_opt_var = self.compute_var(returns.dot(sortino_optimal_weights))
-        min_vol_weights = self.optimize_portfolio(returns, objective='min_volatility')
-        min_vol_return, min_vol_volatility, min_vol_sharpe, min_vol_sortino = self.portfolio_performance(min_vol_weights, returns)
-        result = {
-            'current_portfolio': {
-                'tickers': tickers,
-                'weights': dict(zip(tickers, weights)),
-                'return': annualized_return,
-                'volatility': annualized_volatility,
-                'sharpe_ratio': sharpe_ratio,
-                'sortino_ratio': sortino_ratio,
-                'max_drawdown': max_drawdown,
-                'var': self.compute_var(portfolio_returns)
-            },
-            'optimized_portfolio': {
-                'weights': dict(zip(tickers, optimal_weights)),
-                'return': opt_return,
-                'volatility': opt_volatility,
-                'sharpe_ratio': opt_sharpe,
-                'sortino_ratio': opt_sortino,
-                'max_drawdown': opt_max_drawdown,
-                'var': opt_var
-            },
-            'sortino_optimized_portfolio': {
-                'weights': dict(zip(tickers, sortino_optimal_weights)),
-                'return': sortino_opt_return,
-                'volatility': sortino_opt_volatility,
-                'sharpe_ratio': sortino_opt_sharpe,
-                'sortino_ratio': sortino_opt_sortino,
-                'max_drawdown': sortino_opt_max_drawdown,
-                'var': sortino_opt_var
-            },
-            'min_volatility_portfolio': {
-                'weights': dict(zip(tickers, min_vol_weights)),
-                'return': min_vol_return,
-                'volatility': min_vol_volatility,
-                'sharpe_ratio': min_vol_sharpe,
-                'sortino_ratio': min_vol_sortino
-            },
-            'earliest_dates': earliest_dates
-        }
-        if benchmark_returns is not None:
-            result['benchmark'] = {
-                'ticker': benchmark,
-                'return': bench_return,
-                'volatility': bench_vol,
-                'sharpe_ratio': bench_sharpe,
-                'sortino_ratio': bench_sortino,
-                'max_drawdown': benchmark_max_dd,
-                'var': self.compute_var(benchmark_returns)
-            }
-        return result
-
-    def plot_efficient_frontier(self, returns, n_portfolios=1000, risk_free_rate=0.02, fig_size=(10, 6)):
-        """Compute and print efficient frontier metrics instead of plotting."""
-        np.random.seed(42)
+    def print_efficient_frontier(self, returns, risk_free_rate, n_portfolios=1000):
+        """Calculate and print metrics for the efficient frontier and optimized portfolios."""
+        np.random.seed(42)  # For reproducibility
         n_assets = returns.shape[1]
         all_weights = np.zeros((n_portfolios, n_assets))
         all_returns = np.zeros(n_portfolios)
         all_volatilities = np.zeros(n_portfolios)
         all_sharpe_ratios = np.zeros(n_portfolios)
-        all_sortino_ratios = np.zeros(n_portfolios)
+        
+        # Generate random portfolios
         for i in range(n_portfolios):
             weights = np.random.random(n_assets)
-            weights = weights / np.sum(weights)
+            weights /= weights.sum()
             all_weights[i, :] = weights
-            port_return, port_vol, port_sharpe, port_sortino = self.portfolio_performance(weights, returns)
+            port_return, port_vol, port_sharpe = self.portfolio_performance(weights, returns, risk_free_rate)
             all_returns[i] = port_return
             all_volatilities[i] = port_vol
             all_sharpe_ratios[i] = port_sharpe
-            all_sortino_ratios[i] = port_sortino
 
-        optimal_weights = self.optimize_portfolio(returns, objective='sharpe')
-        opt_return, opt_vol, opt_sharpe, opt_sortino = self.portfolio_performance(optimal_weights, returns)
-        sortino_optimal_weights = self.optimize_portfolio(returns, objective='sortino')
-        sortino_opt_return, sortino_opt_vol, sortino_opt_sharpe, sortino_opt_sortino = self.portfolio_performance(sortino_optimal_weights, returns)
-        min_vol_weights = self.optimize_portfolio(returns, objective='min_volatility')
-        min_vol_return, min_vol_vol, min_vol_sharpe, min_vol_sortino = self.portfolio_performance(min_vol_weights, returns)
-        equal_weights = np.ones(n_assets) / n_assets
-        eq_return, eq_vol, eq_sharpe, eq_sortino = self.portfolio_performance(equal_weights, returns)
+        # Optimize for each specified strategy
+        strategies = {
+            "Max Sharpe": self.optimize_portfolio(returns, risk_free_rate, "sharpe"),
+            "Max Sortino": self.optimize_portfolio(returns, risk_free_rate, "sortino"),
+            "Min Max Drawdown": self.optimize_portfolio(returns, risk_free_rate, "max_drawdown"),
+            "Min Volatility": self.optimize_portfolio(returns, risk_free_rate, "volatility"),
+            "Min Value at Risk": self.optimize_portfolio(returns, risk_free_rate, "value_at_risk")
+        }
+        
+        # Compute performance metrics for each strategy
+        strategy_metrics = {}
+        for name, weights in strategies.items():
+            port_return, port_vol, port_sharpe = self.portfolio_performance(weights, returns, risk_free_rate)
+            strategy_metrics[name] = {
+                "return": port_return,
+                "volatility": port_vol,
+                "sharpe": port_sharpe
+            }
 
-        print("\n**Efficient Frontier Metrics:**")
-        print("\n--- Optimal Portfolio (Max Sharpe) ---")
-        print(f"Return: {opt_return:.2%}")
-        print(f"Volatility: {opt_vol:.2%}")
-        print(f"Sharpe Ratio: {opt_sharpe:.2f}")
-        print(f"Sortino Ratio: {opt_sortino:.2f}")
-
-        print("\n--- Optimal Portfolio (Max Sortino) ---")
-        print(f"Return: {sortino_opt_return:.2%}")
-        print(f"Volatility: {sortino_opt_vol:.2%}")
-        print(f"Sharpe Ratio: {sortino_opt_sharpe:.2f}")
-        print(f"Sortino Ratio: {sortino_opt_sortino:.2f}")
-
-        print("\n--- Minimum Volatility Portfolio ---")
-        print(f"Return: {min_vol_return:.2%}")
-        print(f"Volatility: {min_vol_vol:.2%}")
-        print(f"Sharpe Ratio: {min_vol_sharpe:.2f}")
-        print(f"Sortino Ratio: {min_vol_sortino:.2f}")
-
-        print("\n--- Equal Weight Portfolio ---")
-        print(f"Return: {eq_return:.2%}")
-        print(f"Volatility: {eq_vol:.2%}")
-        print(f"Sharpe Ratio: {eq_sharpe:.2f}")
-        print(f"Sortino Ratio: {eq_sortino:.2f}")
-
-        print("\n--- Simulated Portfolios (Summary) ---")
-        print(f"Average Return: {np.mean(all_returns):.2%}")
-        print(f"Average Volatility: {np.mean(all_volatilities):.2%}")
+        # Print the metrics
+        print("\n===== Efficient Frontier Metrics =====")
+        print("Explanation: These metrics illustrate the risk-return trade-off across thousands of simulated portfolio compositions using your stocks.")
+        print("Key optimized portfolios are detailed below:")
+        print("- Max Sharpe: Highest risk-adjusted return.")
+        print("- Max Sortino: Optimized for downside risk-adjusted return.")
+        print("- Min Max Drawdown: Lowest peak-to-trough loss.")
+        print("- Min Volatility: Lowest overall risk.")
+        print("- Min Value at Risk: Minimized potential daily loss at 90% confidence.")
+        print("\nSimulated Portfolios Summary:")
+        print(f"Average Annualized Return: {np.mean(all_returns):.2%}")
+        print(f"Average Annualized Volatility: {np.mean(all_volatilities):.2%}")
         print(f"Average Sharpe Ratio: {np.mean(all_sharpe_ratios):.2f}")
-        print(f"Average Sortino Ratio: {np.mean(all_sortino_ratios):.2f}")
-        print(f"Max Sharpe Ratio: {np.max(all_sharpe_ratios):.2f}")
-        print(f"Max Sortino Ratio: {np.max(all_sortino_ratios):.2f}")
+        print(f"Best Sharpe Ratio in Simulation: {np.max(all_sharpe_ratios):.2f}")
+        print("\nOptimized Portfolios Metrics:")
+        for name, metrics in strategy_metrics.items():
+            print(f"\n{name}:")
+            print(f"  Annualized Return: {metrics['return']:.2%}")
+            print(f"  Annualized Volatility: {metrics['volatility']:.2%}")
+            print(f"  Sharpe Ratio: {metrics['sharpe']:.2f}")
 
-        return "Efficient frontier metrics printed"
+    def print_cumulative_returns(self, returns, weights_dict, benchmark_returns, earliest_dates, title="Cumulative Returns"):
+        start_date = max(earliest_dates.values()) + timedelta(days=180)
+        adjusted_returns = returns.loc[start_date:]
+        print(f"\n===== {title} (From {start_date.strftime('%Y-%m-%d')}) =====")
+        for label, weights in weights_dict.items():
+            portfolio_returns = adjusted_returns.dot(weights)
+            cumulative = (1 + portfolio_returns).cumprod() - 1
+            print(f"\n{label}:")
+            print(f"  Final Cumulative Return: {cumulative.iloc[-1]:.2%}")
+            print(f"  Average Daily Return: {portfolio_returns.mean():.4%}")
+            print(f"  Standard Deviation of Daily Returns: {portfolio_returns.std():.4%}")
+        for bench_ticker, bench_ret in benchmark_returns.items():
+            bench_cum = (1 + bench_ret.loc[start_date:]).cumprod() - 1
+            print(f"\n{bench_ticker}:")
+            print(f"  Final Cumulative Return: {bench_cum.iloc[-1]:.2%}")
+            print(f"  Average Daily Return: {bench_ret.loc[start_date:].mean():.4%}")
+            print(f"  Standard Deviation of Daily Returns: {bench_ret.loc[start_date:].std():.4%}")
 
-    def plot_portfolio_weights(self, weights_dict, title="Portfolio Weights", fig_size=(10, 6), ax=None):
-        """Print portfolio weights instead of plotting."""
-        print(f"\n**{title}:**")
-        for ticker, weight in weights_dict.items():
-            print(f"{ticker}: {weight:.1%}")
-        return "Portfolio weights printed"
+    def print_crisis_performance(self, returns, weights_dict, benchmark_returns):
+        crisis_start = pd.to_datetime("2020-02-01")
+        crisis_end = pd.to_datetime("2020-04-30")
+        # Find nearest trading days within the returns index
+        available_start = returns.index[returns.index >= crisis_start].min()
+        available_end = returns.index[returns.index <= crisis_end].max()
+        
+        if pd.isna(available_start) or pd.isna(available_end) or available_start > available_end:
+            print("Warning: Crisis period data not available within the analysis range.")
+            return
+        
+        crisis_returns = returns.loc[available_start:available_end]
+        print(f"\n===== COVID-19 Crisis Performance ({available_start.strftime('%Y-%m-%d')} to {available_end.strftime('%Y-%m-%d')}) =====")
+        print("Explanation: These metrics show your portfolio’s performance during the COVID-19 crisis.")
+        print("- Original Portfolio: Performance based on your initial weights.")
+        print("- Optimized Portfolio: Performance with your chosen optimization and weighting.")
+        print(f"- Benchmarks ({', '.join(benchmark_returns.keys())}): Market indices for comparison.")
+        for label, weights in weights_dict.items():
+            portfolio_returns = crisis_returns.dot(weights)
+            cumulative = (1 + portfolio_returns).cumprod() - 1
+            print(f"\n{label}:")
+            print(f"  Final Cumulative Return: {cumulative.iloc[-1]:.2%}")
+            print(f"  Average Daily Return: {portfolio_returns.mean():.4%}")
+            print(f"  Standard Deviation of Daily Returns: {portfolio_returns.std():.4%}")
+        for bench_ticker, bench_ret in benchmark_returns.items():
+            bench_crisis_ret = bench_ret.loc[available_start:available_end]
+            bench_cum = (1 + bench_crisis_ret).cumprod() - 1
+            print(f"\n{bench_ticker}:")
+            print(f"  Final Cumulative Return: {bench_cum.iloc[-1]:.2%}")
+            print(f"  Average Daily Return: {bench_crisis_ret.mean():.4%}")
+            print(f"  Standard Deviation of Daily Returns: {bench_crisis_ret.std():.4%}")
 
-def run_portfolio_analysis(tickers, weights=None, start_date=None, end_date=None, benchmark_tickers=['^GSPC']):
-    """Run a complete portfolio analysis with metrics printed instead of visualizations."""
+    def print_historical_strategies(self, tickers, weights_dict, risk_free_rate, hist_returns=None):
+        start_date = "2015-03-24"
+        end_date = self.today_date
+        if hist_returns is None:
+            data, _, _ = self.fetch_stock_data(tickers, start_date, end_date)
+            if data is None or data.empty:
+                print("Warning: Could not fetch historical data for your portfolio.")
+                return
+            hist_returns = self.compute_returns(data)
+        
+        # Define optimization strategies, including original portfolio
+        strategies = {
+            "Original Portfolio": np.array(list(weights_dict.values())),
+            "Max Sharpe": self.optimize_portfolio(hist_returns, risk_free_rate, "sharpe"),
+            "Max Sortino": self.optimize_portfolio(hist_returns, risk_free_rate, "sortino"),
+            "Min Max Drawdown": self.optimize_portfolio(hist_returns, risk_free_rate, "max_drawdown"),
+            "Min Volatility": self.optimize_portfolio(hist_returns, risk_free_rate, "volatility"),
+            "Min Value at Risk": self.optimize_portfolio(hist_returns, risk_free_rate, "value_at_risk")
+        }
+        
+        # Compute metrics for each strategy
+        annual_metrics = {}
+        for name, weights in strategies.items():
+            portfolio_returns = hist_returns.dot(weights)
+            annual_return = portfolio_returns.mean() * 252
+            annual_volatility = portfolio_returns.std() * np.sqrt(252)
+            max_drawdown = self.compute_max_drawdown(portfolio_returns)
+            annual_metrics[name] = {
+                'Annualized Returns': annual_return,
+                'Annualized Volatility': annual_volatility,
+                'Max Drawdown': max_drawdown
+            }
+
+        # Print the metrics
+        print(f"\n===== Historical Performance of Portfolio Strategies (Past Decade: {start_date} to {end_date}) =====")
+        print(f"Explanation: These metrics show how your portfolio ({', '.join(tickers)}) would have performed under different strategies:")
+        print("- Original Portfolio: Your initial weights, unoptimized.")
+        print("- Max Sharpe: Maximizes return per unit of risk.")
+        print("- Max Sortino: Optimizes upside return vs. downside risk.")
+        print("- Min Max Drawdown: Minimizes the worst loss.")
+        print("- Min Volatility: Reduces overall risk.")
+        print("- Min Value at Risk: Limits potential daily losses at 90% confidence.")
+        print("\nMetrics Explained:")
+        print("- Annualized Returns: Average yearly return; higher is better.")
+        print("- Annualized Volatility: Yearly risk; lower is more stable.")
+        print("- Max Drawdown: Largest loss; less negative is better.")
+        print("Compare these to see how optimization improves your original portfolio.")
+        for name, metrics in annual_metrics.items():
+            print(f"\n{name}:")
+            print(f"  Annualized Returns: {metrics['Annualized Returns']:.2%}")
+            print(f"  Annualized Volatility: {metrics['Annualized Volatility']:.2%}")
+            print(f"  Max Drawdown: {metrics['Max Drawdown']:.2%}")
+
+    def print_weight_allocation_strategies(self, tickers, weights_dict):
+        start_date = "2015-03-24"  # 10 years before 2025-03-23
+        end_date = self.today_date  # 2025-03-23
+        
+        # Fetch portfolio data
+        data, _, _ = self.fetch_stock_data(tickers, start_date, end_date)
+        if data is None or data.empty:
+            print("Warning: Could not fetch historical data for your portfolio.")
+            return
+        hist_returns = self.compute_returns(data)
+        
+        # Define weight allocation strategies, including "None" (original weights)
+        strategies = {
+            "None (Original)": np.array(list(weights_dict.values())),
+            "Equal Weight": self.apply_weight_strategy(hist_returns, "equal"),
+            "Risk Parity": self.apply_weight_strategy(hist_returns, "risk_parity"),
+            "Inverse Volatility": self.apply_weight_strategy(hist_returns, "inverse_volatility")
+        }
+        
+        # Compute metrics for each strategy
+        annual_metrics = {}
+        for name, weights in strategies.items():
+            portfolio_returns = hist_returns.dot(weights)
+            annual_return = portfolio_returns.mean() * 252
+            annual_volatility = portfolio_returns.std() * np.sqrt(252)
+            max_drawdown = self.compute_max_drawdown(portfolio_returns)
+            annual_metrics[name] = {
+                'Annualized Returns': annual_return,
+                'Annualized Volatility': annual_volatility,
+                'Max Drawdown': max_drawdown
+            }
+
+        # Print the metrics
+        print(f"\n===== Historical Performance of Weight Allocation Strategies (Past Decade: {start_date} to {end_date}) =====")
+        print(f"Explanation: These metrics show how your portfolio ({', '.join(tickers)}) would have performed under different weight allocation strategies:")
+        print("- None (Original): Your initial weights, unadjusted.")
+        print("- Equal Weight: Distributes capital evenly across your stocks.")
+        print("- Risk Parity: Balances risk contribution from each stock.")
+        print("- Inverse Volatility: Weights stocks inversely to their volatility.")
+        print("\nMetrics Explained:")
+        print("- Annualized Returns: Average yearly return; higher is better.")
+        print("- Annualized Volatility: Yearly risk; lower is more stable.")
+        print("- Max Drawdown: Largest loss; less negative is better.")
+        print("Use this to decide if adjusting weights improves your original portfolio.")
+        for name, metrics in annual_metrics.items():
+            print(f"\n{name}:")
+            print(f"  Annualized Returns: {metrics['Annualized Returns']:.2%}")
+            print(f"  Annualized Volatility: {metrics['Annualized Volatility']:.2%}")
+            print(f"  Max Drawdown: {metrics['Max Drawdown']:.2%}")
+    
+    def print_comparison_bars(self, original_metrics, optimized_metrics, benchmark_metrics):
+        metrics = ["annual_return", "annual_volatility", "sharpe_ratio", "maximum_drawdown", "value_at_risk"]
+        labels = ["Annual Return", "Annual Volatility", "Sharpe Ratio", "Maximum Drawdown", "Value at Risk (90%)"]
+        print("\n===== Portfolio Comparison Metrics =====")
+        for metric, label in zip(metrics, labels):
+            print(f"\n{label}:")
+            print(f"  Original: {original_metrics[metric]:.2f if 'sharpe' in metric else original_metrics[metric]:.2%}")
+            print(f"  Optimized: {optimized_metrics[metric]:.2f if 'sharpe' in metric else optimized_metrics[metric]:.2%}")
+            if benchmark_metrics:
+                for bench, bm in benchmark_metrics.items():
+                    print(f"  {bench}: {bm[metric]:.2f if 'sharpe' in metric else bm[metric]:.2%}")
+
+def run_portfolio_analysis():
     analyzer = PortfolioAnalyzer()
-    results = analyzer.analyze_portfolio(tickers, weights, start_date, end_date, benchmark=benchmark_tickers[0])
-    if 'error' in results:
-        print(f"Error: {results['error']}")
-        return results
+    tickers = []
+    weights_dict = {}
 
-    print("\n===== PORTFOLIO ANALYSIS =====")
-    print(f"Analysis period: {start_date or analyzer.default_start_date} to {end_date or analyzer.today_date}")
+    # Step 1: Input stocks and optional weights
+    print("Let’s build your portfolio. Enter your stocks, ETFs, or indices (e.g., AAPL, SPY, ^GSPC) one by one.")
+    while True:
+        ticker = input("Enter a stock ticker (or type 'DONE' to finish): ").strip().upper()
+        if ticker == "DONE" and tickers:
+            break
+        if ticker in tickers:
+            print("Warning: This ticker has already been added.")
+            continue
+        try:
+            test_data = yf.download(ticker, period="1mo")
+            if test_data.empty:
+                print(f"Warning: No data found for {ticker}.")
+                continue
+        except Exception as e:
+            print(f"Warning: Error retrieving data for {ticker}: {e}")
+            continue
+        tickers.append(ticker)
+        pct = input(f"Enter percentage for {ticker} (or press Enter for equal weighting later): ").strip()
+        try:
+            weights_dict[ticker] = float(pct) / 100 if pct else None
+        except ValueError:
+            print("Warning: Invalid percentage entered. Treating as equal weighting.")
+            weights_dict[ticker] = None
 
-    current = results['current_portfolio']
-    print("\n----- CURRENT PORTFOLIO -----")
-    print(f"Annual Return: {current['return']:.2%}")
-    print(f"Annual Volatility: {current['volatility']:.2%}")
-    print(f"Sharpe Ratio: {current['sharpe_ratio']:.2f}")
-    print(f"Sortino Ratio: {current['sortino_ratio']:.2f}")
-    print(f"Maximum Drawdown: {current['max_drawdown']:.2%}")
-    print(f"Value at Risk (95%): {current['var']:.2%}")
-
-    optimized = results['optimized_portfolio']
-    print("\n----- OPTIMIZED PORTFOLIO (MAX SHARPE) -----")
-    print(f"Annual Return: {optimized['return']:.2%}")
-    print(f"Annual Volatility: {optimized['volatility']:.2%}")
-    print(f"Sharpe Ratio: {optimized['sharpe_ratio']:.2f}")
-    print(f"Sortino Ratio: {optimized['sortino_ratio']:.2f}")
-    print(f"Maximum Drawdown: {optimized['max_drawdown']:.2%}")
-    print(f"Value at Risk (95%): {optimized['var']:.2%}")
-    sharpe_improvement = (optimized['sharpe_ratio']/current['sharpe_ratio'] - 1) if current['sharpe_ratio'] != 0 else 0
-    sortino_improvement = (optimized['sortino_ratio']/current['sortino_ratio'] - 1) if current['sortino_ratio'] != 0 else 0
-    print(f"Sharpe Ratio Improvement: {sharpe_improvement:.2%}")
-    print(f"Sortino Ratio Improvement: {sortino_improvement:.2%}")
-
-    sortino_optimized = results['sortino_optimized_portfolio']
-    print("\n----- OPTIMIZED PORTFOLIO (MAX SORTINO) -----")
-    print(f"Annual Return: {sortino_optimized['return']:.2%}")
-    print(f"Annual Volatility: {sortino_optimized['volatility']:.2%}")
-    print(f"Sharpe Ratio: {sortino_optimized['sharpe_ratio']:.2f}")
-    print(f"Sortino Ratio: {sortino_optimized['sortino_ratio']:.2f}")
-    print(f"Maximum Drawdown: {sortino_optimized['max_drawdown']:.2%}")
-    print(f"Value at Risk (95%): {sortino_optimized['var']:.2%}")
-    sortino_sharpe_improvement = (sortino_optimized['sharpe_ratio']/current['sharpe_ratio'] - 1) if current['sharpe_ratio'] != 0 else 0
-    sortino_sortino_improvement = (sortino_optimized['sortino_ratio']/current['sortino_ratio'] - 1) if current['sortino_ratio'] != 0 else 0
-    print(f"Sharpe Ratio Improvement: {sortino_sharpe_improvement:.2%}")
-    print(f"Sortino Ratio Improvement: {sortino_sortino_improvement:.2%}")
-
-    if 'benchmark' in results:
-        bench = results['benchmark']
-        print(f"\n----- BENCHMARK ({bench['ticker']}) -----")
-        print(f"Annual Return: {bench['return']:.2%}")
-        print(f"Annual Volatility: {bench['volatility']:.2%}")
-        print(f"Sharpe Ratio: {bench['sharpe_ratio']:.2f}")
-        print(f"Sortino Ratio: {bench['sortino_ratio']:.2f}")
-        print(f"Maximum Drawdown: {bench['max_drawdown']:.2%}")
-        print(f"Value at Risk (95%): {bench['var']:.2%}")
-        rel_perf = current['return'] - bench['return']
-        print(f"\nPortfolio vs Benchmark: {rel_perf:.2%} {'outperformance' if rel_perf > 0 else 'underperformance'}")
-        opt_rel_perf = optimized['return'] - bench['return']
-        print(f"Optimized Portfolio (Max Sharpe) vs Benchmark: {opt_rel_perf:.2%} {'outperformance' if opt_rel_perf > 0 else 'underperformance'}")
-        sortino_opt_rel_perf = sortino_optimized['return'] - bench['return']
-        print(f"Optimized Portfolio (Max Sortino) vs Benchmark: {sortino_opt_rel_perf:.2%} {'outperformance' if sortino_opt_rel_perf > 0 else 'underperformance'}")
-
-    stock_prices, _, earliest_dates = analyzer.fetch_stock_data(tickers, start=start_date, end=end_date)
-    returns_data = analyzer.compute_returns(stock_prices)
-
-    benchmark_data = {}
-    benchmark_returns_dict = {}
-    for bench_ticker in benchmark_tickers:
-        data, _, _ = analyzer.fetch_stock_data([bench_ticker], start=start_date, end=end_date)
-        if data is not None and not data.empty:
-            benchmark_data[bench_ticker] = data
-            benchmark_returns_dict[bench_ticker] = analyzer.compute_returns(data).iloc[:, 0]
-
-    print("\nComputing metrics...")
-
-    # 1. Correlation Matrix
-    corr_metrics = analyzer.plot_correlation_matrix(stock_prices)
-    corr_explanation = (
-        "\n**Correlation Matrix Explanation:**\n"
-        "The printed correlation matrix displays the correlation coefficients among the stocks in your portfolio.\n"
-        "High positive correlations (close to 1) indicate stocks move together, while negative values indicate inverse relationships.\n"
-        "This helps assess diversification."
-    )
-
-    # 2. Efficient Frontier
-    ef_metrics = analyzer.plot_efficient_frontier(returns_data)
-    ef_explanation = (
-        "\n**Efficient Frontier Metrics Explanation:**\n"
-        "The printed metrics show the risk-return trade-off for key portfolios.\n"
-        "Metrics include the optimal portfolio maximizing Sharpe Ratio, the optimal portfolio maximizing Sortino Ratio,\n"
-        "the minimum volatility portfolio, and an equal-weight portfolio.\n"
-        "A summary of simulated portfolios provides average returns, volatilities, and ratios.\n"
-        "The Sortino Ratio focuses on downside risk, providing insight into how the portfolio handles negative returns compared to the Sharpe Ratio."
-    )
-
-    # 3. Portfolio Weights (Current, Sharpe-Optimized, Sortino-Optimized)
-    print("\n**Portfolio Weights Metrics:**")
-    weights_metrics_current = analyzer.plot_portfolio_weights(current['weights'], "Current Portfolio Weights")
-    weights_metrics_optimized = analyzer.plot_portfolio_weights(optimized['weights'], "Optimized Portfolio Weights (Max Sharpe)")
-    weights_metrics_sortino = analyzer.plot_portfolio_weights(sortino_optimized['weights'], "Optimized Portfolio Weights (Max Sortino)")
-    weights_explanation = (
-        "\n**Portfolio Weights Explanation:**\n"
-        "The printed weights show your portfolio's asset allocation for the current, Sharpe-optimized, and Sortino-optimized portfolios,\n"
-        "highlighting how the allocation shifts to improve risk-adjusted performance.\n"
-        "With the minimum investment set to 0%, the optimized portfolios may exclude some assets entirely to maximize their respective objectives."
-    )
-
-    # 4. Cumulative Returns Metrics
-    cum_metrics, weights_df = analyzer.plot_cumulative_returns(
-        returns_data, 
-        np.array(list(current['weights'].values())),
-        benchmark_returns=benchmark_returns_dict,
-        optimized_weights=np.array(list(optimized['weights'].values())),
-        sortino_optimized_weights=np.array(list(sortino_optimized['weights'].values())),
-        earliest_dates=earliest_dates,
-        user_start_date=start_date
-    )
-    delayed_stocks = {t: d.strftime('%Y-%m-%d') for t, d in earliest_dates.items() if d > pd.to_datetime(start_date)}
-    effective_start = max([d for d in earliest_dates.values()] + [pd.to_datetime(start_date)]).strftime('%Y-%m-%d')
-    cum_explanation = (
-        "\n**Cumulative Returns Metrics Explanation:**\n"
-        f"The printed metrics show cumulative returns starting from {effective_start}, normalized to 0%.\n"
-    )
-    if delayed_stocks:
-        cum_explanation += (
-            "Some stocks lacked data back to the user-specified start date and adjusted the metrics' start:\n"
-        )
-        for ticker, date in delayed_stocks.items():
-            cum_explanation += f"  - {ticker}: Data starts {date}\n"
-        cum_explanation += (
-            f"The metrics begin at {effective_start}, the most recent earliest available date, ensuring all portfolio stocks are included.\n"
-            "Weights were dynamically adjusted as stocks became available, maintaining portfolio consistency.\n"
-        )
-    cum_explanation += (
-        "The metrics include final, maximum, and minimum cumulative returns for the current portfolio, Sharpe-optimized portfolio, Sortino-optimized portfolio, and benchmarks.\n"
-        "Cumulative returns are shown as percentages (e.g., 150% means 1.5x initial value).\n"
-        f"The Sharpe-optimized portfolio's Sortino Ratio ({optimized['sortino_ratio']:.2f}) and the Sortino-optimized portfolio's Sortino Ratio ({sortino_optimized['sortino_ratio']:.2f}) indicate their performance in managing downside risk over this period."
-    )
-
-    # 5. Crisis Performance Metrics (COVID-19 only)
-    crisis_metrics = analyzer.plot_crisis_performance(
-        returns_data, 
-        benchmark_returns_dict, 
-        results, 
-        start_date, 
-        end_date, 
-        earliest_dates
-    )
-    covid_start = pd.to_datetime("2020-02-01")
-    late_stocks = {t: d.strftime('%Y-%m-%d') for t, d in earliest_dates.items() if d >= covid_start}
-    crisis_explanation = (
-        "\n**COVID-19 Impact Metrics Explanation:**\n"
-        "The printed metrics illustrate the performance of your portfolio and selected benchmarks during the COVID-19 crisis (2020-02-01 to 2020-04-30).\n"
-        "Metrics include final, maximum, and minimum cumulative returns for the original portfolio, Sharpe-optimized portfolio, Sortino-optimized portfolio, and benchmarks, all normalized to start at 0%.\n"
-    )
-    if late_stocks:
-        crisis_explanation += (
-            "The following stocks lacked price data before the COVID-19 onset (2020-02-01) and were excluded from the portfolio calculations:\n"
-        )
-        for ticker, date in late_stocks.items():
-            crisis_explanation += f"  - {ticker}: Data starts {date}\n"
-        crisis_explanation += (
-            "Only stocks with data before this date contribute to the portfolio metrics, with weights redistributed accordingly.\n"
-        )
+    # Assign weights
+    if all(w is None for w in weights_dict.values()):
+        weights = np.ones(len(tickers)) / len(tickers)
     else:
-        crisis_explanation += (
-            "All stocks had sufficient price data before the COVID-19 period, so no exclusions were necessary.\n"
-        )
-    crisis_explanation += (
-        "The metrics show cumulative returns as percentages, highlighting performance during the crisis.\n"
-        f"The Sharpe-optimized portfolio's Sortino Ratio ({optimized['sortino_ratio']:.2f}) and the Sortino-optimized portfolio's Sortino Ratio ({sortino_optimized['sortino_ratio']:.2f}) reflect their ability to mitigate downside risk during this volatile period, compared to their Sharpe Ratios ({optimized['sharpe_ratio']:.2f} and {results['sortino_optimized_portfolio']['sharpe_ratio']:.2f})."
-    )
+        total = sum(w for w in weights_dict.values() if w is not None)
+        if total > 1:
+            print("Warning: Total percentage exceeds 100%. Normalizing weights.")
+            weights = np.array([weights_dict[t] for t in tickers])
+            weights /= weights.sum()
+        elif total == 0:
+            weights = np.ones(len(tickers)) / len(tickers)
+        else:
+            remaining = 1 - total
+            num_none = sum(1 for w in weights_dict.values() if w is None)
+            weights = np.array([weights_dict[t] if weights_dict[t] is not None else remaining / num_none for t in tickers])
+    weights_dict = dict(zip(tickers, weights))
 
-    print("\n===== ORIGINAL PORTFOLIO ANALYSIS INSIGHTS =====")
-    print("• The efficient frontier metrics indicate that your current portfolio has a moderate Sharpe ratio, suggesting room for enhanced risk-adjusted returns.")
-    print(f"• The Sortino Ratio ({current['sortino_ratio']:.2f}) highlights the portfolio's exposure to downside risk, which may be more relevant if you're concerned about losses rather than overall volatility (Sharpe: {current['sharpe_ratio']:.2f}).")
-    print("• The cumulative returns metrics reveal that while your portfolio has grown, there have been periods of underperformance relative to benchmarks.")
-    print("• The COVID-19 performance metrics show significant drawdowns, highlighting sensitivity during market stress, which aligns with the Sortino Ratio's focus on downside risk.")
-
-    print("\n===== OPTIMIZED PORTFOLIO (MAX SHARPE) ANALYSIS INSIGHTS =====")
-    print("• The Sharpe-optimized portfolio adjusts weights to maximize the Sharpe ratio, reflecting improved risk-adjusted returns.")
-    print(f"• Its Sortino Ratio ({optimized['sortino_ratio']:.2f}) indicates its performance in managing downside risk compared to the original portfolio (Sortino: {current['sortino_ratio']:.2f}).")
-    print("• The rebalanced asset allocation (as seen in the weights metrics) indicates a shift toward assets that optimize total risk-adjusted returns, with some assets potentially excluded (0% weight).")
-    print("• The Sharpe-optimized portfolio shows different cumulative returns and drawdowns during the COVID-19 crisis compared to the original portfolio, reflecting its focus on total volatility.")
-
-    print("\n===== OPTIMIZED PORTFOLIO (MAX SORTINO) ANALYSIS INSIGHTS =====")
-    print("• The Sortino-optimized portfolio adjusts weights to maximize the Sortino ratio, focusing on minimizing downside risk.")
-    print(f"• Its Sortino Ratio ({sortino_optimized['sortino_ratio']:.2f}) is optimized, indicating superior management of downside risk compared to the original (Sortino: {current['sortino_ratio']:.2f}) and Sharpe-optimized portfolios (Sortino: {optimized['sortino_ratio']:.2f}).")
-    print("• The rebalanced asset allocation (as seen in the weights metrics) prioritizes assets that reduce negative returns, with some assets potentially excluded (0% weight).")
-    print("• The Sortino-optimized portfolio may show more resilience during the COVID-19 crisis, as seen in the crisis performance metrics, due to its focus on downside risk.")
-
-    print("\n===== APPENDIX =====")
-    print("Key Formulas and Data Metric Explanations:")
-    print("1. Annual Return = (Average Daily Return) x 252")
-    print("2. Annual Volatility = (Standard Deviation of Daily Returns) x √252")
-    print("3. Sharpe Ratio = (Annual Return - Risk-Free Rate) / Annual Volatility")
-    print("   - Measures risk-adjusted return, considering total volatility (both upside and downside).")
-    print("   - A higher Sharpe Ratio indicates better return per unit of risk.")
-    print("4. Sortino Ratio = (Annual Return - Risk-Free Rate) / Downside Deviation")
-    print("   - Similar to Sharpe Ratio but focuses only on downside risk (negative returns below a target, here 0%).")
-    print("   - Downside Deviation = Standard Deviation of negative returns, annualized.")
-    print("   - A higher Sortino Ratio indicates better return per unit of downside risk, making it more relevant for investors concerned about losses.")
-    print("   - Difference from Sharpe: Sharpe penalizes both upside and downside volatility, while Sortino only penalizes downside, better reflecting investor preference for upside volatility.")
-    print("5. Maximum Drawdown = Minimum[(Portfolio Value - Cumulative Maximum Portfolio Value) / Cumulative Maximum Portfolio Value]")
-    print("6. Value at Risk (VaR, 95%) = -nth percentile of daily returns, where n = (1 - 0.95) x total observations")
-    print("7. Portfolio Return = Dot product of portfolio weights and mean daily returns, annualized by multiplying by 252")
-    print("8. Optimization uses the SLSQP method with constraints that ensure weights sum to 1, each weight is capped (default 25%), and minimum investment is 0%.")
-
-    # Add metrics and explanations to results (no plots)
-    results['metrics'] = {
-        'correlation_matrix': corr_metrics,
-        'efficient_frontier': ef_metrics,
-        'portfolio_weights_current': weights_metrics_current,
-        'portfolio_weights_optimized': weights_metrics_optimized,
-        'portfolio_weights_sortino': weights_metrics_sortino,
-        'cumulative_returns': cum_metrics,
-        'crisis_performance': crisis_metrics
-    }
-    results['explanations'] = {
-        'correlation_matrix': corr_explanation,
-        'efficient_frontier': ef_explanation,
-        'portfolio_weights': weights_explanation,
-        'cumulative_returns': cum_explanation,
-        'crisis_performance': crisis_explanation
-    }
-
-    return results
-
-@app.route('/analyze', methods=['POST'])
-def analyze_portfolio():
-    """API endpoint to analyze a portfolio."""
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'No JSON data provided'}), 400
-
-    # Extract parameters from request
-    tickers = data.get('tickers', [])
-    weights = data.get('weights', None)
-    start_date = data.get('start_date', None)
-    end_date = data.get('end_date', None)
-    benchmark_tickers = data.get('benchmark_tickers', ['^GSPC'])
-
-    # Validation
-    if not tickers or not isinstance(tickers, list) or len(tickers) == 0:
-        return jsonify({'error': 'Tickers must be a non-empty list'}), 400
-    
-    if weights is not None:
-        if not isinstance(weights, list) or len(weights) != len(tickers):
-            return jsonify({'error': 'Weights must be a list matching the number of tickers'}), 400
-        total_weight = sum(weights)
-        if not 0.99 <= total_weight <= 1.01:  # Allow small float precision errors
-            return jsonify({'error': 'Weights must sum to approximately 100% (1.0)'}), 400
-    
-    if start_date:
-        try:
-            datetime.strptime(start_date, '%Y-%m-%d')
-        except ValueError:
-            return jsonify({'error': 'Start date must be in YYYY-MM-DD format'}), 400
-    
-    if end_date:
-        try:
-            datetime.strptime(end_date, '%Y-%m-%d')
-        except ValueError:
-            return jsonify({'error': 'End date must be in YYYY-MM-DD format'}), 400
-    
-    if not isinstance(benchmark_tickers, list) or len(benchmark_tickers) == 0:
-        return jsonify({'error': 'Benchmark tickers must be a non-empty list'}), 400
-
+    # Step 2: Start date
+    start_date = input(f"Enter the start date for analysis (YYYY-MM-DD, or press Enter for {analyzer.default_start_date}): ") or analyzer.default_start_date
     try:
-        results = run_portfolio_analysis(tickers, weights, start_date, end_date, benchmark_tickers)
-        return jsonify(results)
-    except Exception as e:
-        print(f"Error during analysis: {str(e)}")
-        return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
+        datetime.strptime(start_date, "%Y-%m-%d")
+    except ValueError:
+        print("Warning: Invalid date format. Using default start date.")
+        start_date = analyzer.default_start_date
+    end_date = analyzer.today_date
 
-@app.route('/', methods=['GET'])
-def home():
-    """Home endpoint with API usage instructions."""
-    return jsonify({
-        'message': 'Welcome to the Portfolio Analyzer API',
-        'endpoint': '/analyze',
-        'method': 'POST',
-        'example': {
-            'tickers': ['AAPL', 'MSFT'],
-            'weights': [0.6, 0.4],
-            'start_date': '2020-01-01',
-            'end_date': '2023-01-01',
-            'benchmark_tickers': ['^GSPC']
-        },
-        'notes': 'Weights are optional (defaults to equal weighting if omitted). Dates are optional (defaults to 2015-01-01 to today).'
-    })
+    # Step 3: Benchmarks
+    benchmark_options = {"1": "^GSPC", "2": "^IXIC", "3": "^DJI", "4": "^RUT", "5": "MSCI"}
+    print("\nChoose benchmarks to compare your portfolio against:")
+    print("A benchmark is a standard (like a market index) used to evaluate your portfolio’s performance.")
+    print("Options: 1. ^GSPC (S&P 500), 2. ^IXIC (NASDAQ), 3. ^DJI (Dow Jones), 4. ^RUT (Russell 2000), 5. MSCI (World Index)")
+    bench_choice = input("Enter numbers (e.g., 1,3, or press Enter for ^GSPC): ").strip()
+    benchmarks = [benchmark_options.get(c.strip(), "^GSPC") for c in bench_choice.split(",") if c.strip()] or ["^GSPC"]
+
+    # Fetch data and analyze
+    # Step 4: Risk Tolerance and Risk-Free Rate
+    print("\nWhat’s your risk tolerance? (This helps tailor your portfolio)")
+    print("1. Low (prefer stability), 2. Medium (balanced), 3. High (maximize returns)")
+    risk_choice = input("Enter your choice (1-3, or press Enter for Medium): ").strip() or "2"
+    risk_map = {"1": "low", "2": "medium", "3": "high"}
+    risk_tolerance = risk_map.get(risk_choice, "medium")
+    
+    treasury_yield = analyzer.fetch_treasury_yield()
+    print(f"Current 10-year U.S. Treasury yield is {treasury_yield:.4%}.")
+    rf_input = input(f"Enter the risk-free rate (e.g., 0.0425 for 4.25%, or press Enter to use {treasury_yield:.4%}): ").strip()
+    try:
+        risk_free_rate = float(rf_input) if rf_input else treasury_yield
+    except ValueError:
+        print(f"Warning: Invalid input. Using current 10-year Treasury yield of {treasury_yield:.4%}.")
+        risk_free_rate = treasury_yield
+
+    # Fetch data and analyze
+    stock_prices, _, earliest_dates = analyzer.fetch_stock_data(tickers, start_date, end_date)
+    if stock_prices is None or stock_prices.empty:
+        print("Error: No valid stock data available.")
+        return
+    returns = analyzer.compute_returns(stock_prices)
+    if returns.empty:
+        print("Error: No valid returns data.")
+        return
+    portfolio_returns = returns.dot(list(weights_dict.values()))
+
+    benchmark_returns = {}
+    benchmark_metrics = {}
+    for bench in benchmarks:
+        bench_data, _, _ = analyzer.fetch_stock_data([bench], start_date, end_date)
+        if bench_data is not None and not bench_data.empty:
+            bench_returns = analyzer.compute_returns(bench_data)[bench]
+            benchmark_returns[bench] = bench_returns
+            benchmark_metrics[bench] = {
+                "annual_return": bench_returns.mean() * 252,
+                "annual_volatility": bench_returns.std() * np.sqrt(252),
+                "sharpe_ratio": analyzer.portfolio_performance(np.array([1.0]), pd.DataFrame(bench_returns), risk_free_rate)[2],
+                "maximum_drawdown": analyzer.compute_max_drawdown(bench_returns),
+                "value_at_risk": analyzer.compute_var(bench_returns, 0.90)
+            }
+
+    original_metrics = {
+        "annual_return": portfolio_returns.mean() * 252,
+        "annual_volatility": portfolio_returns.std() * np.sqrt(252),
+        "sharpe_ratio": analyzer.portfolio_performance(np.array(list(weights_dict.values())), returns, risk_free_rate)[2],
+        "maximum_drawdown": analyzer.compute_max_drawdown(portfolio_returns),
+        "value_at_risk": analyzer.compute_var(portfolio_returns, 0.90)
+    }
+
+    # Portfolio Analysis
+    print("\n===== PORTFOLIO ANALYSIS =====")
+    print(f"Analysis period: {start_date} to {end_date}")
+    print("\n----- Original Portfolio Metrics -----")
+    print(f"Annual Return: {original_metrics['annual_return']:.2%}")
+    print("Explanation: This is the average yearly return your portfolio earned.")
+    print("Hint: Aim for this to beat your benchmark for better growth!")
+    print(f"Annual Volatility: {original_metrics['annual_volatility']:.2%}")
+    print("Explanation: This measures the risk or variability of your portfolio’s returns.")
+    print(f"Sharpe Ratio: {original_metrics['sharpe_ratio']:.2f}")
+    print("Explanation: This shows return per unit of risk; higher is better.")
+    print(f"Maximum Drawdown: {original_metrics['maximum_drawdown']:.2%}")
+    print("Explanation: This is the largest peak-to-trough loss your portfolio experienced.")
+    print(f"Value at Risk (90%): {original_metrics['value_at_risk']:.2%}")
+    print("Explanation: This estimates the potential loss in a worst-case scenario at 90% confidence.")
+
+    analyzer.print_correlation_matrix(stock_prices)
+
+    print("\n----- Benchmark Metrics -----")
+    for bench, metrics in benchmark_metrics.items():
+        print(f"\nBenchmark: {bench}")
+        print(f"Annual Return: {metrics['annual_return']:.2%}")
+        print(f"Annual Volatility: {metrics['annual_volatility']:.2%}")
+        print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+        print(f"Maximum Drawdown: {metrics['maximum_drawdown']:.2%}")
+        print(f"Value at Risk (90%): {metrics['value_at_risk']:.2%}")
+
+    print("\n----- ISSUES WITH YOUR ORIGINAL PORTFOLIO: WHAT YOU NEED TO KNOW -----")
+    print("Now that you understand the metrics, let’s look at potential problems with your portfolio.")
+    print("For each issue, I’ll explain what it means, why it’s a concern, and what you can do about it.\n")
+
+    issues = []
+
+    # Issue 1: Annual Return Compared to Benchmark
+    for bench_ticker, bench_metrics in benchmark_metrics.items():
+        bench_return = bench_metrics['annual_return']
+        if original_metrics['annual_return'] < bench_return:
+            return_diff = ((bench_return - original_metrics['annual_return']) * 100)  # Absolute difference in percentage points
+            issues.append({
+                'metric': f'Annual Return vs {bench_ticker}',
+                'description': (
+                    f"Your portfolio’s Annual Return ({original_metrics['annual_return']:.2%}) is lower than the {bench_ticker} benchmark ({bench_return:.2%}) by {return_diff:.1f} percentage points.\n"
+                    "   - What This Means: The benchmark represents the average performance of the market or sector. If your portfolio grows less than the benchmark, you’re missing out on potential gains.\n"
+                    "   - Why It’s a Concern: Imagine you’re in a race, and the benchmark is the average runner. If you’re running slower (lower return), you’re not keeping up with what most investors are earning. For example, if you invested $10,000, your portfolio would grow to ${10000 * (1 + original_metrics['annual_return']):.0f} in a year, while the benchmark would grow to ${10000 * (1 + bench_return):.0f}. Over time, this gap can mean a lot less money for your goals, like saving for retirement or a big purchase.\n"
+                    "   - What You Can Do: Consider a strategy that focuses on higher returns, like Max Sharpe Ratio, which aims to get you the best growth for the risk you take. You might also look at adding stocks that have historically performed better than the market, such as growth stocks in sectors like technology."
+                )
+            })
+        else:
+            print(f"✓ Your Annual Return is higher than the {bench_ticker} benchmark—great job! You’re outperforming this market index.")
+
+    # Issue 2: High Volatility
+    if original_metrics['annual_volatility'] > 0.20:
+        issues.append({
+            'metric': 'Annual Volatility',
+            'description': (
+                f"Your portfolio’s Annual Volatility ({original_metrics['annual_volatility']:.2%}) is high, above the typical range of 10-20% for a diversified portfolio.\n"
+                "   - What This Means: Volatility measures how much your portfolio’s value goes up and down over a year. Think of it like a rollercoaster: high volatility means a wild ride with big ups and downs, which can be stressful and risky.\n"
+                "   - Why It’s a Concern: High volatility increases the chance of losing money, especially during market downturns. For example, if the market drops 10%, a high-volatility portfolio might drop 15% or more. If you had $10,000 invested, a 15% drop means a $1,500 loss in value, and it would take a 17.6% gain just to break even. This kind of swing can make it harder to achieve steady growth toward your financial goals.\n"
+                "   - What You Can Do: To smooth out the ride, consider a strategy like Min Volatility, which focuses on lowering volatility, potentially bringing it closer to 10-15%. Adding more stable investments, like bonds or low-volatility stocks (e.g., utilities), can also help."
+            )
+        })
+    elif original_metrics['annual_volatility'] > 0.10:
+        print(f"⚠ Your Annual Volatility ({original_metrics['annual_volatility']:.2%}) is moderate. It’s within a typical range, but you might still reduce it for more stability if you prefer a smoother investment experience.")
+    else:
+        print("✓ Your Annual Volatility is low—nice work! Your portfolio is relatively stable.")
+
+    # Issue 3: Low Sharpe Ratio
+    if original_metrics['sharpe_ratio'] < 1:
+        issues.append({
+            'metric': 'Sharpe Ratio',
+            'description': (
+                f"Your Sharpe Ratio ({original_metrics['sharpe_ratio']:.2f}) is below 1, which is considered poor.\n"
+                "   - What This Means: The Sharpe Ratio shows how much return you’re getting for the risk you’re taking. A low Sharpe Ratio means you’re not getting enough reward (returns) for the ups and downs (volatility) in your portfolio.\n"
+                "   - Why It’s a Concern: Think of it like buying a car: if you’re paying a high price (taking on a lot of risk) but getting a slow car (low returns), it’s not a good deal. For example, if you’re earning a 5% return but your portfolio swings by 20% (high volatility), you’re taking a lot of risk for a small reward. A higher Sharpe Ratio, like 1.5, would mean better returns for the same level of risk—more bang for your buck.\n"
+                "   - What You Can Do: A strategy like Max Sharpe Ratio can help by optimizing your portfolio to get the best return for the risk, potentially pushing your Sharpe Ratio above 1. You might also consider reducing risk (volatility) while maintaining or increasing returns, perhaps by diversifying your investments across different sectors or adding less volatile assets."
+            )
+        })
+    elif original_metrics['sharpe_ratio'] < 2:
+        print(f"⚠ Your Sharpe Ratio ({original_metrics['sharpe_ratio']:.2f}) is decent but below 2, which is considered great. You might improve it for better risk-adjusted returns.")
+    else:
+        print("✓ Your Sharpe Ratio is excellent—well done! You’re getting strong returns for the risk you’re taking.")
+
+    # Issue 4: High Maximum Drawdown
+    if original_metrics['maximum_drawdown'] < -0.20:
+        recovery_gain = (1 / (1 + original_metrics['maximum_drawdown']) - 1) * 100
+        issues.append({
+            'metric': 'Maximum Drawdown',
+            'description': (
+                f"Your Maximum Drawdown ({original_metrics['maximum_drawdown']:.2%}) is concerning, indicating significant historical losses.\n"
+                "   - What This Means: Maximum Drawdown shows the largest drop your portfolio experienced from its peak to its lowest point. A drop of {abs(original_metrics['maximum_drawdown']):.2%} means at its worst, your portfolio lost {abs(original_metrics['maximum_drawdown']):.2%} of its value from a previous high.\n"
+                "   - Why It’s a Concern: A big drawdown can be hard to recover from. For example, with a {abs(original_metrics['maximum_drawdown']):.2%} drop, if you had $10,000, you’d lose ${10000 * abs(original_metrics['maximum_drawdown']):.0f}, leaving you with ${10000 * (1 + original_metrics['maximum_drawdown']):.0f}. To recover, you’d need a {recovery_gain:.1f}% gain, which could take a long time. This could delay your financial goals, like buying a house or retiring.\n"
+                "   - What You Can Do: A strategy like Min Maximum Drawdown can help by focusing on reducing these big losses, potentially keeping drawdowns under 20%. You might also diversify your portfolio more or include assets like bonds or gold that are less likely to drop sharply during market crashes."
+            )
+        })
+    else:
+        print("✓ Your Maximum Drawdown is within a reasonable range—good job! Your portfolio hasn’t experienced extreme losses.")
+
+    # Issue 5: High Value at Risk (VaR)
+    if original_metrics['value_at_risk'] < -0.05:
+        issues.append({
+            'metric': 'Value at Risk (VaR, 90%)',
+            'description': (
+                f"Your Value at Risk ({original_metrics['value_at_risk']:.2%}) is high, indicating a significant potential for daily losses.\n"
+                "   - What This Means: VaR estimates the maximum loss you might expect on a typical day, with 90% confidence. A VaR of {abs(original_metrics['value_at_risk']):.2%} means there’s a 10% chance you could lose {abs(original_metrics['value_at_risk']):.2%} or more of your portfolio’s value in a single day.\n"
+                "   - Why It’s a Concern: High daily losses can be unsettling and risky. For example, if you have $10,000 invested, a VaR of {abs(original_metrics['value_at_risk']):.2%} means there’s a 10% chance you could lose ${10000 * abs(original_metrics['value_at_risk']):.0f} or more in one day. It’s like knowing there’s a small chance of a big storm hitting your house—you’d want to be prepared.\n"
+                "   - What You Can Do: To lower your VaR, consider a strategy like Min Value at Risk, which focuses on reducing downside risk, potentially bringing your VaR closer to 3-4%. You might also reduce your exposure to very volatile stocks and add more stable investments, like bonds or dividend-paying stocks."
+            )
+        })
+    else:
+        print("✓ Your Value at Risk is within a reasonable range—nice work! Your portfolio’s potential daily losses are manageable.")
+
+    # Display All Issues
+    if issues:
+        print("Here are the key issues identified in your portfolio:")
+        for i, issue in enumerate(issues, 1):
+            print(f"\nIssue {i}: {issue['metric']}")
+            print(issue['description'])
+    else:
+        print("✓ No major issues found with your portfolio—great job! It’s well-balanced based on the metrics analyzed.")
+
+    print("\n===== CUMULATIVE RETURNS OF STRATEGIES =====")
+    strategies = {
+        "Original Portfolio": np.array(list(weights_dict.values())),
+        "Max Sharpe": analyzer.optimize_portfolio(returns, risk_free_rate, "sharpe"),
+        "Max Sortino": analyzer.optimize_portfolio(returns, risk_free_rate, "sortino"),
+        "Min Max Drawdown": analyzer.optimize_portfolio(returns, risk_free_rate, "max_drawdown"),
+        "Min Volatility": analyzer.optimize_portfolio(returns, risk_free_rate, "volatility"),
+        "Min Value at Risk": analyzer.optimize_portfolio(returns, risk_free_rate, "value_at_risk")
+    }
+    analyzer.print_cumulative_returns(returns, strategies, benchmark_returns, earliest_dates)
+
+    print("\n===== HIGH-LEVEL INSIGHTS ON EACH STRATEGY =====")
+    print("• Max Sharpe: Optimizes risk-adjusted return.")
+    print("• Min Volatility: Prioritizes low risk.")
+    print("• Equal Weight: Simple diversification.")
+
+    # Moved Historical Performance section here
+    print("\n===== HISTORICAL PERFORMANCE OF PORTFOLIO STRATEGIES (PAST DECADE) =====")
+    hist_start_date = "2015-03-24"
+    hist_data, _, _ = analyzer.fetch_stock_data(tickers, hist_start_date, end_date)
+    if hist_data is not None and not hist_data.empty:
+        hist_returns = analyzer.compute_returns(hist_data)
+        analyzer.print_historical_strategies(tickers, weights_dict, risk_free_rate, hist_returns)
+    else:
+        print("Warning: Historical data unavailable.")
+
+    print("\n===== OPTIMIZATION OPTIONS =====")
+    print("Optimize by: 1. Sharpe Ratio, 2. Sortino Ratio, 3. Maximum Drawdown, 4. Volatility, 5. Value at Risk")
+    metric_choice = input("Enter your choice (1-5): ").strip()
+    metric_map = {"1": "sharpe", "2": "sortino", "3": "max_drawdown", "4": "volatility", "5": "value_at_risk"}
+    opt_metric = metric_map.get(metric_choice, "sharpe")
+
+    min_alloc = input("Enter minimum allocation per stock (e.g., 0.05 for 5%, or press Enter for 0%): ").strip()
+    max_alloc = input("Enter maximum allocation per stock (e.g., 0.30 for 30%, or press Enter for 100%): ").strip()
+    try:
+        min_allocation = float(min_alloc) if min_alloc else 0.0
+        max_allocation = float(max_alloc) if max_alloc else 1.0
+    except ValueError:
+        print("Warning: Invalid allocation input. Using defaults (0% min, 100% max).")
+        min_allocation, max_allocation = 0.0, 1.0
+    opt_weights = analyzer.optimize_portfolio(returns, risk_free_rate, opt_metric, min_allocation, max_allocation)
+
+    # Weight Allocation Strategies and Choice
+    print("\n===== HISTORICAL WEIGHT ALLOCATION STRATEGIES ON NASDAQ =====")
+    analyzer.print_weight_allocation_strategies(tickers, weights_dict)
+
+    print("\nWeight allocation: 1. Risk Parity, 2. Equal Weighting, 3. Inverse-Volatility, 4. None")
+    weight_choice = input("Enter your choice (1-4): ").strip()
+    weight_map = {"1": "risk_parity", "2": "equal", "3": "inverse_volatility", "4": None}
+    weight_strategy = weight_map.get(weight_choice, None)
+
+    # Apply optimization and strategy
+    opt_weights = analyzer.optimize_portfolio(returns, risk_free_rate, opt_metric)
+    if weight_strategy:
+        strategy_weights = analyzer.apply_weight_strategy(returns, weight_strategy)
+        optimized_weights = (opt_weights + strategy_weights) / 2
+    else:
+        optimized_weights = opt_weights
+
+    optimized_metrics = {
+        "annual_return": analyzer.portfolio_performance(optimized_weights, returns, risk_free_rate)[0],
+        "annual_volatility": analyzer.portfolio_performance(optimized_weights, returns, risk_free_rate)[1],
+        "sharpe_ratio": analyzer.portfolio_performance(optimized_weights, returns, risk_free_rate)[2],
+        "maximum_drawdown": analyzer.compute_max_drawdown(returns.dot(optimized_weights)),
+        "value_at_risk": analyzer.compute_var(returns.dot(optimized_weights), 0.90)
+    }
+
+    print("\nIssues Addressed by Optimization:")
+    if not issues:
+        print("No major issues were identified in your original portfolio.")
+    else:
+        for issue in issues:
+            metric = issue['metric']  # Keep original case
+            fixed = False
+            if "Annual Return vs" in metric:
+                bench_ticker = metric.split("vs ")[1].strip()  # Preserve case of ticker
+                bench_return = benchmark_metrics[bench_ticker]['annual_return']
+                fixed = optimized_metrics['annual_return'] >= bench_return
+            elif "Annual Volatility" in metric:
+                fixed = optimized_metrics['annual_volatility'] <= 0.20
+            elif "Sharpe Ratio" in metric:
+                fixed = optimized_metrics['sharpe_ratio'] >= 1
+            elif "Maximum Drawdown" in metric:
+                fixed = optimized_metrics['maximum_drawdown'] >= -0.20
+            elif "Value at Risk" in metric:
+                fixed = optimized_metrics['value_at_risk'] >= -0.05
+            status = "✓ Fixed" if fixed else "✗ Not Fully Resolved"
+            print(f"- {issue['metric']}: {status}")
+
+    print("\n===== COMBINED OPTIMIZED PERFORMANCE =====")
+    combined_strategies = {
+        "Original Portfolio": np.array(list(weights_dict.values())),
+        "Optimized Portfolio": optimized_weights
+    }
+    analyzer.print_cumulative_returns(returns, combined_strategies, benchmark_returns, earliest_dates, "Optimized vs Original Cumulative Returns")
+
+    # Final comparisons
+    print("\n===== OPTIMIZED PORTFOLIO COMPARISONS =====")
+    analyzer.print_comparison_bars(original_metrics, optimized_metrics, benchmark_metrics)
+    print("Insights:")
+    print(f"- Risk: Optimized volatility ({optimized_metrics['annual_volatility']:.2%}) vs Original ({original_metrics['annual_volatility']:.2%}).")
+    print(f"- Returns: Optimized return ({optimized_metrics['annual_return']:.2%}) vs Original ({original_metrics['annual_return']:.2%}).")
+    start_date_obj = max(earliest_dates.values()) + timedelta(days=180)
+    initial_investment = 10000
+    opt_cum = (1 + returns.dot(optimized_weights)).cumprod()[-1] * initial_investment
+    orig_cum = (1 + returns.dot(list(weights_dict.values()))).cumprod()[-1] * initial_investment
+    print(f"- Money Made (from {start_date_obj.strftime('%Y-%m-%d')} with $10,000): Optimized: ${opt_cum:.2f}, Original: ${orig_cum:.2f}")
+
+    if start_date_obj < pd.to_datetime("2020-02-01"):
+        print("\n===== COVID-19 PERFORMANCE =====")
+        analyzer.print_crisis_performance(returns, combined_strategies, benchmark_returns)
+
+    # Resources and Appendix
+    print("\n===== RESOURCES AND APPENDIX =====")
+    print("Formulas:")
+    print("1. Annual Return = (Average Daily Return) × 252")
+    print("2. Annual Volatility = (Standard Deviation of Daily Returns) × √252")
+    print("3. Sharpe Ratio = (Annual Return - Risk-Free Rate) / Annual Volatility")
+    print("4. Maximum Drawdown = Minimum[(Cumulative Value - Peak Value) / Peak Value]")
+    print("5. Value at Risk (90%) = 10th percentile of daily returns")
+    print("6. Sortino Ratio = (Annual Return - Risk-Free Rate) / Downside Deviation")
+    print("7. Risk Parity = Weights proportional to inverse of risk contribution")
+    print("8. Inverse-Volatility = Weights inversely proportional to stock volatility")
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+    run_portfolio_analysis()
