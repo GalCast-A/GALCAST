@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Portfolio Analyzer</title>
+</head>
+<body>
+    <h1>Portfolio Analyzer</h1>
+    {% if error %}
+        <p style="color: red;">Error: {{ error }}</p>
+    {% endif %}
+    <form method="POST">
+        <label for="tickers">Tickers (comma-separated, e.g., AAPL,MSFT):</label><br>
+        <input type="text" id="tickers" name="tickers" required><br><br>
+
+        <label for="weights">Weights (comma-separated, e.g., 0.5,0.5):</label><br>
+        <input type="text" id="weights" name="weights" required><br><br>
+
+        <label for="start_date">Start Date (YYYY-MM-DD):</label><br>
+        <input type="text" id="start_date" name="start_date" value="2015-01-01" required><br><br>
+
+        <label for="risk_tolerance">Risk Tolerance:</label><br>
+        <select id="risk_tolerance" name="risk_tolerance">
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+        </select><br><br>
+
+        <label for="benchmarks">Benchmarks (comma-separated, e.g., ^GSPC,^IXIC):</label><br>
+        <input type="text" id="benchmarks" name="benchmarks" value="^GSPC"><br><br>
+
+        <label for="optimization_metric">Optimization Metric:</label><br>
+        <select id="optimization_metric" name="optimization_metric">
+            <option value="sharpe">Max Sharpe Ratio</option>
+            <option value="sortino">Max Sortino Ratio</option>
+            <option value="volatility">Min Volatility</option>
+            <option value="max_drawdown">Min Max Drawdown</option>
+            <option value="var">Min VaR</option>
+        </select><br><br>
+
+        <input type="submit" value="Analyze Portfolio">
+    </form>
+</body>
+</html>
