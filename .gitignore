@@ -1,6 +1,27 @@
+# Virtual environments
 venv/
+
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Environment variables
 .env
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+
+# macOS/Linux temporary files
+.DS_Store
+
+# Generated plot files (unless served in static/)
+*.png
+*.jpg
+*.jpeg
+
+# Bolt.new or deployment-specific files
+*.log
