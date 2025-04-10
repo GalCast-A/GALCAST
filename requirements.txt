@@ -1,8 +1,12 @@
 flask
+gunicorn
+PyPortfolioOpt
 yfinance
 numpy
 pandas
 matplotlib
 seaborn
 scipy
-gunicorn
+statsmodels
+scikit-learn
+plotly
