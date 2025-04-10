@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Portfolio Analysis Results</title>
+</head>
+<body>
+    <h1>Portfolio Analysis Results</h1>
+
+    <h2>Metrics</h2>
+    <p>Annual Return: {{ metrics['annual_return'] }}</p>
+    <p>Annual Volatility: {{ metrics['annual_volatility'] }}</p>
+    <p>Sharpe Ratio: {{ metrics['sharpe_ratio'] }}</p>
+    <p>Sortino Ratio: {{ metrics['sortino_ratio'] }}</p>
+    <p>Maximum Drawdown: {{ metrics['max_drawdown'] }}</p>
+    <p>Value at Risk (VaR): {{ metrics['var'] }}</p>
+    <p>Beta: {{ metrics['beta'] }}</p>
+
+    <h2>Optimized Weights</h2>
+    {% for ticker, weight in optimized_weights.items() %}
+        <p>{{ ticker }}: {{ weight }}</p>
+    {% endfor %}
+
+    <h2>Recommendations</h2>
+    <p>Short Term: {{ recommendations['short_term'] }}</p>
+    <p>Medium Term: {{ recommendations['medium_term'] }}</p>
+    <p>Long Term: {{ recommendations['long_term'] }}</p>
+
+    <h2>Benchmark Comparison</h2>
+    {% for benchmark, bm_metrics in benchmark_metrics.items() %}
+        <p>{{ benchmark }}:</p>
+        <p>Annual Return: {{ bm_metrics['annual_return'] }}</p>
+        <p>Volatility: {{ bm_metrics['annual_volatility'] }}</p>
+    {% endfor %}
+
+    <p><a href="/">Back</a></p>
+</body>
+</html>
