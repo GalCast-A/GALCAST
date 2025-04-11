@@ -27,10 +27,16 @@ from plotly.subplots import make_subplots
 
 
 class PortfolioAnalyzer:
-    def __init__(self):
+    def __init__(self, tickers, weights, start_date, risk_tolerance):
+        self.tickers = tickers
+        self.weights = weights
+        self.start_date = start_date
+        self.risk_tolerance = risk_tolerance
         self.today_date = datetime.now().strftime("%Y-%m-%d")  # Use current date dynamically
         self.default_start_date = (datetime.strptime(self.today_date, "%Y-%m-%d") - timedelta(days=3652)).strftime("%Y-%m-%d")  # 10 years ago
         self.data_cache = {}  # In-memory cache for stock data
+        self.data = None
+        self.returns = None
 
 
 
