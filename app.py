@@ -3,7 +3,7 @@ from portfolio_analyzer import PortfolioAnalyzer
 import os
 
 app = Flask(__name__)
-
+     
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
@@ -24,7 +24,12 @@ def index():
 
         # Fetch data and compute metrics
         try:
-            stock_data = analyzer.fetch_stock_data()
+            stock_data, error_tickers, earliest_dates = analyzer.fetch_stock_data(analyzer.tickers)
+            if stock_data is None:
+                error_msg = "Failed to fetch stock data. "
+                if error_tickers:
+                    error_msg += "Errors: " + "; ".join([f"{ticker}: {msg}" for ticker, msg in error_tickers.items()])
+                return render_template('index.html', error=error_msg)
             returns = analyzer.compute_returns(stock_data)
             metrics = analyzer.compute_portfolio_metrics(returns, stock_data)
             optimized_weights = analyzer.optimize_portfolio(returns, optimization_metric=optimization_metric)
