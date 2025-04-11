@@ -1,5 +1,6 @@
 from flask import Flask, request, render_template
 from portfolio_analyzer import PortfolioAnalyzer
+import os
 
 app = Flask(__name__)
 
@@ -14,6 +15,10 @@ def index():
         benchmarks = request.form['benchmarks'].split(',')
         optimization_metric = request.form['optimization_metric']
 
+        # Basic validation
+        if abs(sum(weights) - 1.0) > 0.01:
+            return render_template('index.html', error="Weights must sum to 1.0")
+
         # Initialize PortfolioAnalyzer
         analyzer = PortfolioAnalyzer(tickers, weights, start_date=start_date, risk_tolerance=risk_tolerance)
 
@@ -24,8 +29,6 @@ def index():
             metrics = analyzer.compute_portfolio_metrics(returns, stock_data)
             optimized_weights = analyzer.optimize_portfolio(returns, optimization_metric=optimization_metric)
             recommendations = analyzer.suggest_courses_of_action(metrics, optimized_weights)
-
-            # Compare with benchmarks
             benchmark_metrics = analyzer.compare_with_benchmarks(benchmarks)
 
             return render_template('results.html', 
@@ -39,4 +42,5 @@ def index():
     return render_template('index.html')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.getenv('PORT', 5001))
+    app.run(host='0.0.0.0', port=port, debug=True)
